@@ -21,6 +21,8 @@
 > - Qt: automatic save backups. Each time the game finishes writing its save, a copy goes to `backups/<ROM name>/<date-time>.sav`
 >   next to the ROM (at most one per 5 minutes, newest 30 kept, identical saves skipped). File > Save games > セーブのバックアップを開く
 >   opens the folder. Config `saveBackup=0` turns it off.
+> - Windows release zips include an empty `portable.ini`, so settings (`config.ini`, `qt.ini`) are kept next to `mGBA.exe`
+>   instead of `%APPDATA%\mGBA`, which is shared with other mGBA builds that overwrite `config.ini` when they save.
 > - LTO is off by default (`BUILD_LTO`): with it, the Lua bindings break on this branch.
 > - Games that use the second half of a 64MiB ROM, flash banks 2-95 or the extra RAM only work on this build;
 >   other emulators and real hardware cannot use them.
