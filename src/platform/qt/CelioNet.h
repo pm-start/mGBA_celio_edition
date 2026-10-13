@@ -166,6 +166,8 @@ private:
 	std::deque<Incoming> m_incoming;
 	std::atomic<bool> m_hasIncoming{false};
 	std::atomic<bool> m_resetRequested{false};
+	std::atomic<bool> m_linkActive{false};
+	std::atomic<bool> m_roleSet{false};
 
 	std::mutex m_outLock;
 	std::condition_variable m_outCond;

@@ -611,6 +611,8 @@ bool CelioNet::startCommon(Kind kind, std::shared_ptr<CoreController> controller
 	m_stopping = false;
 	m_connected = false;
 	m_inSession = false;
+	m_linkActive = false;
+	m_roleSet = false;
 	m_sessionAck = -1;
 	m_nextAck = 0;
 	m_outSequence = 0;
@@ -679,6 +681,8 @@ bool CelioNet::startCommon(Kind kind, std::shared_ptr<CoreController> controller
 
 void CelioNet::stop(bool touchCore) {
 	m_stopping = true;
+	m_linkActive = false;
+	m_roleSet = false;
 	if (m_connected && m_inSession) {
 		sendText("42[\"sessionLeft\"]");
 	}
@@ -849,7 +853,7 @@ void CelioNet::emitData(const std::vector<uint16_t>& data) {
 }
 
 void CelioNet::drainIncoming() {
-	if (m_resetRequested.exchange(false) && m_device) {
+	if (m_resetRequested.exchange(false) && m_device && !m_roleSet) {
 		m_device->resetState(true);
 		m_device->mode = Mode::Slave;
 		m_mask->mask = 0xFFFF;
@@ -885,14 +889,19 @@ void CelioNet::drainIncoming() {
 		case CmdEmuSessionStart:
 			emitStatus(AwaitMode);
 			break;
+		case CmdCancel:
+			log("device command Cancel");
+			break;
 		case CmdSetModeSlave:
 			log("device command SetModeSlave");
+			m_roleSet = true;
 			d->handshake = Handshake::Listening;
 			d->mode = Mode::Slave;
 			setSioMask(0x600B);
 			break;
 		case CmdSetModeMaster:
 			log("device command SetModeMaster");
+			m_roleSet = true;
 			d->handshake = Handshake::Listening;
 			d->mode = Mode::Master;
 			setSioMask(0x601F);
@@ -1202,6 +1211,8 @@ void CelioNet::netThread() {
 			break;
 		}
 		log("connection lost, retrying");
+		m_linkActive = false;
+		m_roleSet = false;
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 	}
 	m_connected = false;
@@ -1318,6 +1329,8 @@ void CelioNet::handleAck(long id, const std::string& json) {
 	}
 	m_inSession = true;
 	m_deviceOn = true;
+	m_roleSet = false;
+	m_linkActive = !m_joinRoom.empty();
 	if (m_joinRoom.empty()) {
 		setState(State::WaitingPartner, "へやの 番号を 相手に つたえて、まってください");
 	} else {
@@ -1362,6 +1375,11 @@ void CelioNet::handleEvent(const std::string& json, long ackId) {
 		log("server command " + std::to_string(command));
 		pushIncoming(Incoming{true, (uint16_t) command, {}});
 	} else if (name == "partnerJoined") {
+		if (m_linkActive.exchange(true)) {
+			log("partnerJoined ignored (already linking)");
+			return;
+		}
+		m_roleSet = false;
 		setState(State::Linking, "相手が はいりました。通信の じゅんびを しています…");
 		m_resetRequested = true;
 		m_expectedSequence = 0;
@@ -1373,11 +1391,15 @@ void CelioNet::handleEvent(const std::string& json, long ackId) {
 		}
 		startLinkMode();
 	} else if (name == "partnerLeft") {
+		m_linkActive = false;
+		m_roleSet = false;
 		setState(State::WaitingPartner, "相手が ぬけました。へやの 番号を つたえて、まってください");
 		std::lock_guard<std::mutex> lock(m_outLock);
 		m_linkStartAt = 0;
 	} else if (name == "sessionClose") {
 		m_inSession = false;
+		m_linkActive = false;
+		m_roleSet = false;
 		m_deviceOn = false;
 		setState(State::Finished, "通信が おわりました");
 		m_stopping = true;
