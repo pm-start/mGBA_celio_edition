@@ -2256,7 +2256,7 @@ void Window::setController(CoreController* controller, const QString& fname) {
 	connect(m_controller.get(), &CoreController::failed, this, &Window::gameFailed);
 	connect(m_controller.get(), &CoreController::unimplementedBiosCall, this, &Window::unimplementedBiosCall);
 #ifdef _WIN32
-	CelioNetView::hookController(m_controller);
+	CelioNetView::hookController(m_controller, m_config);
 #endif
 	SaveBackup::hookController(m_controller);
 

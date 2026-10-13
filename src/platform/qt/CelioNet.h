@@ -93,6 +93,11 @@ public:
 	static void vblankHook(void* context);
 	static void timer3Hook(void* context);
 
+	// Server to use for the next start (empty host = built-in default). Copied at start.
+	void setServer(const std::string& host, int port, bool secure, const char* source = "dialog");
+	bool serverConfigured();
+	void failStart(const std::string& message, const std::string& logLine);
+
 private:
 	CelioNet() = default;
 
@@ -195,6 +200,16 @@ private:
 
 	Kind m_kind = Kind::Net;
 	std::string m_portName;
+	std::string m_cfgHost; // set by setServer
+	int m_cfgPort = 0;
+	bool m_cfgSecure = true;
+	std::string m_cfgSource;
+	bool m_cfgSet = false;
+	std::mutex m_cfgLock;
+	std::string m_useSource;
+	std::string m_useHost; // copy taken at startCommon, read by netThread
+	int m_usePort = 0;
+	bool m_useSecure = true;
 	int m_listenPort = 0;
 	std::unique_ptr<CelioPort> m_port;
 	std::thread m_portThread;

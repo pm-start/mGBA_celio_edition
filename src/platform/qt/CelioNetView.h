@@ -19,6 +19,7 @@ class QPushButton;
 
 namespace QGBA {
 
+class ConfigController;
 class CoreController;
 class Window;
 
@@ -29,7 +30,7 @@ public:
 	CelioNetView(Window* window, QWidget* parent = nullptr);
 
 	// MGBA_CELIO_NET=create | join:<room> starts the link once the game runs (for scripts and tests)
-	static void hookController(std::shared_ptr<CoreController> controller);
+	static void hookController(std::shared_ptr<CoreController> controller, ConfigController* config);
 
 private slots:
 	void create();
@@ -39,10 +40,15 @@ private slots:
 	void refresh();
 	void refreshPorts();
 	void direct();
+	void resetServer();
 
 private:
 	static std::string usbPortFromEnv();
+	static bool parseServer(const QString& text, bool tls, std::string& host, int& port, bool& outTls);
+	static bool savedTls(ConfigController* config);
+	static bool applySavedServer(ConfigController* config);
 	std::string selectedPort() const;
+	bool applyServer();
 
 	Window* m_window;
 	QLabel* m_status;
@@ -55,6 +61,10 @@ private:
 	QComboBox* m_ports;
 	QPushButton* m_refreshPorts;
 	QPushButton* m_direct;
+	QLineEdit* m_server;
+	QCheckBox* m_wss;
+	QPushButton* m_serverReset;
+	QString m_serverError;
 	QCheckBox* m_useUsb;
 	QTimer m_timer;
 };

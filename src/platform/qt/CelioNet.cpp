@@ -586,6 +586,27 @@ bool CelioNet::startFakeAdapter(std::shared_ptr<CoreController> controller, int 
 	return startCommon(Kind::FakeAdapter, controller, std::string(), std::string(), listenPort);
 }
 
+bool CelioNet::serverConfigured() {
+	std::lock_guard<std::mutex> lock(m_cfgLock);
+	return m_cfgSet;
+}
+
+void CelioNet::failStart(const std::string& message, const std::string& logLine) {
+	const char* logPath = getenv("MGBA_CELIO_NET_LOG");
+	m_logPath = logPath ? logPath : "";
+	log(logLine);
+	setState(State::Error, message);
+}
+
+void CelioNet::setServer(const std::string& host, int port, bool secure, const char* source) {
+	std::lock_guard<std::mutex> lock(m_cfgLock);
+	m_cfgSet = true;
+	m_cfgSource = source;
+	m_cfgHost = host;
+	m_cfgPort = port;
+	m_cfgSecure = secure;
+}
+
 bool CelioNet::startCommon(Kind kind, std::shared_ptr<CoreController> controller, const std::string& room, const std::string& port, int listenPort) {
 	stop();
 	bool needsCore = kind != Kind::NetUsb;
@@ -599,6 +620,13 @@ bool CelioNet::startCommon(Kind kind, std::shared_ptr<CoreController> controller
 	}
 	const char* logPath = getenv("MGBA_CELIO_NET_LOG");
 	m_logPath = logPath ? logPath : "";
+	{
+		std::lock_guard<std::mutex> lock(m_cfgLock);
+		m_useHost = m_cfgHost;
+		m_usePort = m_cfgPort;
+		m_useSecure = m_cfgSecure;
+		m_useSource = m_cfgSource;
+	}
 	m_kind = kind;
 	m_portName = port;
 	m_listenPort = listenPort;
@@ -655,7 +683,19 @@ bool CelioNet::startCommon(Kind kind, std::shared_ptr<CoreController> controller
 		if (m_port) {
 			portCommand(CmdGetFirmwareInfo);
 		}
-		setState(State::Connecting, "サーバーに つないでいます…");
+		{
+			std::string eff = "celio-server.up.railway.app:443 (wss)";
+			if (!m_useHost.empty()) {
+				eff = m_useHost + ":" + std::to_string(m_usePort) + (m_useSecure ? " (wss)" : " (ws)");
+			}
+			const char* envServer = getenv("MGBA_CELIO_NET_SERVER");
+			bool envOn = envServer && *envServer;
+			if (envOn) {
+				eff = std::string(envServer) + " (ws)";
+			}
+			log("server " + eff + " [" + (envOn ? std::string("env") : m_useHost.empty() ? std::string("default") : m_useSource) + "]");
+			setState(State::Connecting, "サーバー " + eff + " に つないでいます…" + (envOn ? "（環境変数を つかっています）" : ""));
+		}
 		m_net = std::thread(&CelioNet::netThread, this);
 		break;
 	case Kind::Direct:
@@ -1148,7 +1188,12 @@ bool CelioNet::connectOnce(bool first) {
 	std::string host = "celio-server.up.railway.app";
 	int port = 443;
 	bool secure = true;
-	// MGBA_CELIO_NET_SERVER=host:port (plain ws, for a self-hosted Celio-Server)
+	if (!m_useHost.empty()) {
+		host = m_useHost;
+		port = m_usePort;
+		secure = m_useSecure;
+	}
+	// MGBA_CELIO_NET_SERVER=host:port (plain ws, for a self-hosted Celio-Server); wins over the dialog
 	const char* server = getenv("MGBA_CELIO_NET_SERVER");
 	if (server && *server) {
 		std::string s = server;

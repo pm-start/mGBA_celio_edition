@@ -6,6 +6,7 @@
 #include "CelioNetView.h"
 
 #include "CelioNet.h"
+#include "ConfigController.h"
 #include "CoreController.h"
 #include "Window.h"
 
@@ -19,6 +20,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QVBoxLayout>
 
@@ -44,6 +46,23 @@ CelioNetView::CelioNetView(Window* window, QWidget* parent)
 		"2 人とも同じ ROM を使ってください。"));
 	help->setWordWrap(true);
 	layout->addWidget(help);
+
+	QHBoxLayout* serverRow = new QHBoxLayout;
+	serverRow->addWidget(new QLabel(tr("サーバー")));
+	m_server = new QLineEdit;
+	m_server->setPlaceholderText(QStringLiteral("celio-server.up.railway.app:443"));
+	m_wss = new QCheckBox(tr("wss（暗号あり）"));
+	m_wss->setChecked(true);
+	m_serverReset = new QPushButton(tr("既定に もどす"));
+	serverRow->addWidget(m_server, 1);
+	serverRow->addWidget(m_wss);
+	serverRow->addWidget(m_serverReset);
+	layout->addLayout(serverRow);
+	{
+		ConfigController* cfg = m_window->config();
+		m_server->setText(cfg->getOption("netlink.server"));
+		m_wss->setChecked(savedTls(cfg));
+	}
 
 	QHBoxLayout* createRow = new QHBoxLayout;
 	m_create = new QPushButton(tr("へやを つくる"));
@@ -109,6 +128,7 @@ CelioNetView::CelioNetView(Window* window, QWidget* parent)
 	connect(m_copy, &QAbstractButton::clicked, this, &CelioNetView::copyRoom);
 	connect(m_refreshPorts, &QAbstractButton::clicked, this, &CelioNetView::refreshPorts);
 	connect(m_direct, &QAbstractButton::clicked, this, &CelioNetView::direct);
+	connect(m_serverReset, &QAbstractButton::clicked, this, &CelioNetView::resetServer);
 	connect(m_useUsb, &QAbstractButton::toggled, this, &CelioNetView::refresh);
 	refreshPorts();
 	connect(&m_timer, &QTimer::timeout, this, &CelioNetView::refresh);
@@ -116,7 +136,7 @@ CelioNetView::CelioNetView(Window* window, QWidget* parent)
 	refresh();
 }
 
-void CelioNetView::hookController(std::shared_ptr<CoreController> controller) {
+void CelioNetView::hookController(std::shared_ptr<CoreController> controller, ConfigController* config) {
 	CoreController* raw = controller.get();
 	QObject::connect(raw, &CoreController::stopping, []() {
 		CelioNet::instance()->stop(false);
@@ -128,11 +148,14 @@ void CelioNetView::hookController(std::shared_ptr<CoreController> controller) {
 	std::string mode = env;
 	std::weak_ptr<CoreController> weak = controller;
 	auto conn = std::make_shared<QMetaObject::Connection>();
-	*conn = QObject::connect(raw, &CoreController::started, [weak, mode, conn]() {
+	*conn = QObject::connect(raw, &CoreController::started, [weak, mode, conn, config]() {
 		QObject::disconnect(*conn);
-		QTimer::singleShot(1000, [weak, mode]() {
+		QTimer::singleShot(1000, [weak, mode, config]() {
 			std::shared_ptr<CoreController> c = weak.lock();
 			if (!c) {
+				return;
+			}
+			if (mode != "direct" && mode.compare(0, 12, "fakeadapter:") != 0 && !applySavedServer(config)) {
 				return;
 			}
 			// direct | usbcreate | usbjoin:<room> use MGBA_CELIO_USB (COM5, tcp:host:port) or the first adapter
@@ -204,7 +227,97 @@ void CelioNetView::direct() {
 	refresh();
 }
 
+void CelioNetView::resetServer() {
+	m_server->clear();
+	m_wss->setChecked(true);
+	m_serverError.clear();
+}
+
+// Parse "[ws://|wss://]host[:port]" (empty = default server). false = invalid text.
+bool CelioNetView::parseServer(const QString& text, bool tls, std::string& host, int& port, bool& outTls) {
+	host.clear();
+	port = 0;
+	outTls = tls;
+	if (text.isEmpty()) {
+		return true;
+	}
+	QString rest = text;
+	if (rest.startsWith("wss://")) {
+		outTls = true;
+		rest = rest.mid(6);
+	} else if (rest.startsWith("ws://")) {
+		outTls = false;
+		rest = rest.mid(5);
+	}
+	bool bad = rest.isEmpty() || rest.contains(QRegularExpression("\\s")) || rest.endsWith(':');
+	port = outTls ? 443 : 80;
+	QString hostPart = rest;
+	if (!bad) {
+		int colon = rest.indexOf(':');
+		if (colon >= 0) {
+			hostPart = rest.left(colon);
+			QString portPart = rest.mid(colon + 1);
+			bool ok = false;
+			port = portPart.toInt(&ok);
+			bad = !ok || port < 1 || port > 65535 || portPart.contains(':');
+		}
+		bad = bad || hostPart.isEmpty();
+	}
+	if (bad) {
+		return false;
+	}
+	host = hostPart.toStdString();
+	return true;
+}
+
+// netlink.tls in config.ini [ports.qt]: absent = wss
+bool CelioNetView::savedTls(ConfigController* cfg) {
+	QString tls = cfg->getOption("netlink.tls").trimmed().toLower();
+	return !(tls == "0" || tls == "false");
+}
+
+// Called when a link starts without the dialog (MGBA_CELIO_NET): use the saved dialog setting.
+// false = the saved text is invalid; nothing is started.
+bool CelioNetView::applySavedServer(ConfigController* cfg) {
+	CelioNet* net = CelioNet::instance();
+	if (net->serverConfigured() || !cfg) {
+		return true;
+	}
+	QString text = cfg->getOption("netlink.server");
+	std::string host;
+	int port = 0;
+	bool useTls = savedTls(cfg);
+	if (!parseServer(text, useTls, host, port, useTls)) {
+		net->failStart("サーバーの かきかたが ちがいます", "saved server invalid: " + text.toStdString());
+		return false;
+	}
+	net->setServer(host, port, useTls, "config");
+	return true;
+}
+
+// Parse the server field and hand it to CelioNet. Invalid text: no start, no fallback.
+bool CelioNetView::applyServer() {
+	QString text = m_server->text();
+	bool tls = m_wss->isChecked();
+	std::string host;
+	int port = 0;
+	if (!parseServer(text, tls, host, port, tls)) {
+		m_serverError = tr("サーバーの かきかたが ちがいます");
+		m_status->setText(m_serverError);
+		return false;
+	}
+	m_serverError.clear();
+	CelioNet::instance()->setServer(host, port, tls, "dialog");
+	ConfigController* cfg = m_window->config();
+	cfg->setOption("netlink.server", text.toUtf8().constData());
+	cfg->setOption("netlink.tls", tls);
+	return true;
+}
+
 void CelioNetView::create() {
+	if (!applyServer()) {
+		return;
+	}
 	if (m_useUsb->isChecked()) {
 		CelioNet::instance()->startNetUsb(selectedPort(), std::string());
 	} else {
@@ -214,6 +327,9 @@ void CelioNetView::create() {
 }
 
 void CelioNetView::join() {
+	if (!applyServer()) {
+		return;
+	}
 	QString room = m_roomInput->text().trimmed();
 	if (room.isEmpty()) {
 		return;
@@ -260,6 +376,9 @@ void CelioNetView::refresh() {
 	m_direct->setEnabled(hasGame && hasPort && !running);
 	m_useUsb->setEnabled(!running);
 	m_ports->setEnabled(!running);
+	m_server->setEnabled(!running);
+	m_wss->setEnabled(!running);
+	m_serverReset->setEnabled(!running);
 	m_refreshPorts->setEnabled(!running);
 	m_disconnect->setEnabled(running);
 	m_copy->setEnabled(!s.room.empty() && running);
@@ -267,6 +386,9 @@ void CelioNetView::refresh() {
 	QString status = QString::fromUtf8(s.message.c_str());
 	if (!hasGame && !running && !useUsb && status.isEmpty()) {
 		status = tr("ゲームを起動してから使ってください");
+	}
+	if (!running && !m_serverError.isEmpty()) {
+		status = m_serverError;
 	}
 	m_status->setText(status);
 }
