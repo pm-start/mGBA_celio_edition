@@ -40,6 +40,13 @@ public:
 	void load(const ConfigController*);
 	void save(ConfigController*) const;
 
+	// Log files: normal = FATAL+ERROR+WARN only, debug = every level.
+	// Debug is on with --log-debug, the environment variable MGBA_DEBUG_LOG (not empty, not 0) or the config key debugLog=1.
+	bool debugMode() const { return m_debug; }
+	static void requestDebug();
+	static bool debugRequested(const ConfigController* = nullptr);
+	static QString defaultLogFile();
+
 signals:
 	void logPosted(int level, int category, const QString& log);
 	void levelsSet(int levels);
@@ -67,10 +74,14 @@ private:
 	mLogFilter m_filter;
 	bool m_logToFile = false;
 	bool m_logToStdout = false;
+	bool m_debug = false;
+	int m_fileLevels = mLOG_WARN | mLOG_ERROR | mLOG_FATAL;
+	QString m_logPath;
 	std::unique_ptr<QFile> m_logFile;
 	std::unique_ptr<QTextStream> m_logStream;
 
 	static LogController s_global;
+	static bool s_debugArg;
 	static int s_qtCat;
 };
 

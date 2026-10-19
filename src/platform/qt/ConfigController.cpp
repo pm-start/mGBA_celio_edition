@@ -7,6 +7,7 @@
 
 #include "ActionMapper.h"
 #include "CoreController.h"
+#include "LogController.h"
 #include "scripting/AutorunScriptModel.h"
 
 #include <QDir>
@@ -20,6 +21,7 @@
 static const mOption s_frontendOptions[] = {
 	{ "ecard", true, '\0' },
 	{ "mb", true, '\0' },
+	{ "log-debug", false, '\0' },
 #ifdef ENABLE_SCRIPTING
 	{ "script", true, '\0' },
 #endif
@@ -162,7 +164,9 @@ ConfigController::ConfigController(QObject* parent)
 	m_subparsers[1].usage = "Frontend options:\n"
 	      "  --ecard FILE   Scan an e-Reader card in the first loaded game\n"
 	      "                 Can be passed multiple times for multiple cards\n"
-	      "  --mb FILE      Boot a multiboot image with FILE inserted into the ROM slot"
+	      "  --mb FILE      Boot a multiboot image with FILE inserted into the ROM slot\n"
+	      "  --log-debug    Write every log level (INFO, DEBUG, STUB, game output) to logs/mGBA.log\n"
+	      "                 (same as MGBA_DEBUG_LOG=1 or debugLog=1 in config.ini; MGBA_LOG_DIR sets the folder)"
 #ifdef ENABLE_SCRIPTING
 	    "\n  --script FILE  Run a script on start. Can be passed multiple times\n"
 #endif
@@ -179,6 +183,10 @@ ConfigController::ConfigController(QObject* parent)
 			}
 			ecards.append(QString::fromUtf8(arg));
 			self->m_argvOptions[optionName] = ecards;
+			return true;
+		}
+		if (optionName == QLatin1String("log-debug")) {
+			LogController::requestDebug();
 			return true;
 		}
 		if (optionName == QLatin1String("mb")) {

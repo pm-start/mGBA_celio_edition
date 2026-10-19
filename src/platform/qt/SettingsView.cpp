@@ -756,7 +756,7 @@ void SettingsView::reloadConfig() {
 	loadSetting("showFilename", m_ui.showFilename, false);
 	loadSetting("autoload", m_ui.autoload, true);
 	loadSetting("autosave", m_ui.autosave, false);
-	loadSetting("logToFile", m_ui.logToFile);
+	loadSetting("logToFile", m_ui.logToFile, true);
 	loadSetting("logToStdout", m_ui.logToStdout);
 	loadSetting("logFile", m_ui.logFile);
 	loadSetting("useDiscordPresence", m_ui.useDiscordPresence);

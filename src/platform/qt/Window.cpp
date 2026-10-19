@@ -325,7 +325,7 @@ void Window::loadConfig() {
 void Window::reloadConfig() {
 	const mCoreOptions* opts = m_config->options();
 
-	m_log.setLevels(opts->logLevel);
+	m_log.setLevels(m_log.debugMode() ? mLOG_ALL : opts->logLevel);
 
 	if (m_controller) {
 		m_controller->loadConfig(m_config);
