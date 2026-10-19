@@ -1395,6 +1395,12 @@ void CelioNet::handleEvent(const std::string& json, long ackId) {
 	}
 	name = json.substr(2, e - 2);
 
+	// Answer every event the server sends with an ackId (deviceData is answered below).
+	// Without a reply the public Celio server stops after its retry limit and closes the room.
+	if (ackId >= 0 && name != "deviceData") {
+		sendText("43" + std::to_string(ackId) + "[true]");
+	}
+
 	if (name == "deviceData") {
 		if (ackId >= 0) {
 			sendText("43" + std::to_string(ackId) + "[true]");
