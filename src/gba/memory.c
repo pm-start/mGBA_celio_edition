@@ -914,6 +914,43 @@ void GBAStore32(struct ARMCore* cpu, uint32_t address, int32_t value, int* cycle
 	}
 }
 
+// SuperCard の SDRAM の書き込み（モード 0x09FFFFFE: 0xA55A・0xA55A・値・値で切り替え・bit2＝書き込み可・bit1＝SD の窓）の真似。
+// 曲の窓（0x09E00000〜0x09E70000）の試験用: 環境変数 MGBA_SCEMU=1 のときだけ・32MB ちょうどの ROM だけ。SD の窓（モード 3）は真似ない。
+static bool _scEmuStore16(struct GBA* gba, uint32_t address, uint16_t value) {
+	static int enabled = -1;
+	static int seq = 0;
+	static uint16_t pending = 0;
+	static uint16_t mode = 1;
+	if (enabled < 0) {
+		const char* env = getenv("MGBA_SCEMU");
+		enabled = env && env[0] == '1';
+	}
+	if (!enabled || gba->memory.romSize != GBA_SIZE_ROM0 || (address >> 24) != 9) {
+		return false;
+	}
+	uint32_t off = address & 0x01FFFFFE;
+	if (off == 0x01FFFFFE) {
+		if (seq < 2) {
+			seq = value == 0xA55A ? seq + 1 : 0;
+		} else if (seq == 2) {
+			pending = value;
+			seq = 3;
+		} else {
+			if (value == pending) {
+				mode = value;
+			}
+			seq = 0;
+		}
+		return true;
+	}
+	if ((mode & 4) && !(mode & 2) && off >= 0x01E00000 && off < 0x01E70000) {
+		_pristineCow(gba);
+		STORE_16(value, off, gba->memory.rom);
+		return true;
+	}
+	return false;
+}
+
 void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycleCounter) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	struct GBAMemory* memory = &gba->memory;
@@ -986,6 +1023,9 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 		}
 		// Fall through
 	case GBA_REGION_ROM0_EX:
+		if (_scEmuStore16(gba, address, value)) {
+			break;
+		}
 		if ((address & 0x00FFFFFF) >= AGB_PRINT_BASE) {
 			uint32_t agbPrintAddr = address & 0x00FFFFFF;
 			if (agbPrintAddr == AGB_PRINT_PROTECT) {
