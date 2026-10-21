@@ -180,6 +180,8 @@ DECL_BITS(GBAMosaicControl, ObjH, 8, 4);
 DECL_BITS(GBAMosaicControl, ObjV, 12, 4);
 
 struct GBAVideoRenderer {
+	/* Owning core for opt-in HGX virtual background resources. */
+	struct GBA* p;
 	void (*init)(struct GBAVideoRenderer* renderer);
 	void (*reset)(struct GBAVideoRenderer* renderer);
 	void (*deinit)(struct GBAVideoRenderer* renderer);

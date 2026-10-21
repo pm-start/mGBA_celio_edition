@@ -483,7 +483,232 @@
 		return; \
 	}
 
+/* HGX2 is explicitly enabled by the ROM header (reserved bytes B5..BB).
+ * Header B8 may name the HGX pointer register at 040003E0.
+ * Descriptor: magic, BG mask, four screen-map pointers, generation, fade word.
+ * Fade word: BGR555 color in bits 0..14, coefficient 0..16 in bits 16..20.
+ * Maps contain 1024 {tileAddress | hFlip | vFlip<<1, paletteAddress, resourceFlags} entries.
+ * resourceFlags: bit31 = BIOS LZ77 source, low10 = decoded tile index;
+ * bit30 enables expected native screen word comparison (bits10..25).
+ * Resources may be in EWRAM, IWRAM or the 64 MiB ROM aperture. No bus reads,
+ * callbacks or guest writes occur while rendering. Invalid resources fall back
+ * to the native screen entry. Color zero retains normal GBA transparency. */
+static const uint8_t* _hgxResource(struct GBA* gba, uint32_t address, size_t size) {
+	uint32_t offset;
+	if (address >= 0x02000000 && address < 0x02040000) {
+		offset = address - 0x02000000;
+		if (size <= 0x40000 - offset) {
+			return (const uint8_t*) gba->memory.wram + offset;
+		}
+	} else if (address >= 0x03000000 && address < 0x03008000) {
+		offset = address - 0x03000000;
+		if (size <= 0x8000 - offset) {
+			return (const uint8_t*) gba->memory.iwram + offset;
+		}
+	} else if (address >= 0x08000000 && address < 0x0C000000) {
+		offset = address - 0x08000000;
+		if (offset <= gba->memory.romSize && size <= gba->memory.romSize - offset) {
+			return (const uint8_t*) gba->memory.rom + offset;
+		}
+	}
+	return NULL;
+}
+
+/* BIOS-compatible LZ77 (type 0x10), decoded lazily and bounded to 64 KiB.
+ * Entry metadata retains the original ROM pointer, so loading a state in a
+ * fresh emulator rebuilds exactly the same resource without host cache IDs. */
+static const uint8_t* _hgxLZTile(struct GBAVideoSoftwareRenderer* renderer, uint32_t source, unsigned tileIndex) {
+	if (source < 0x08000000 || source >= 0x0C000000) { return NULL; }
+	unsigned slot;
+	for (slot = 0; slot < 64; ++slot) {
+		if (renderer->hgxSources[slot] == source) { break; }
+	}
+	if (slot == 64) {
+		slot = renderer->hgxNext++ & 63;
+		free(renderer->hgxDecoded[slot]);
+		renderer->hgxDecoded[slot] = NULL;
+		renderer->hgxSizes[slot] = 0;
+		renderer->hgxSources[slot] = source;
+		const uint8_t* header = _hgxResource(renderer->d.p, source, 4);
+		uint32_t value = 0;
+		if (header) { LOAD_32(value, 0, header); }
+		size_t size = value >> 8;
+		if ((value & 255) != 0x10 || !size || size > 0x10000) { return NULL; }
+		uint8_t* data = malloc(size);
+		if (!data) { return NULL; }
+		unsigned cursor = 4;
+		size_t out = 0;
+		bool valid = true;
+		while (out < size && valid) {
+			const uint8_t* input = _hgxResource(renderer->d.p, source + cursor++, 1);
+			if (!input) { valid = false; break; }
+			unsigned flags = *input;
+			for (unsigned bit = 0; bit < 8 && out < size; ++bit) {
+				if (flags & (0x80 >> bit)) {
+					input = _hgxResource(renderer->d.p, source + cursor, 2);
+					cursor += 2;
+					if (!input) { valid = false; break; }
+					unsigned count = (input[0] >> 4) + 3;
+					unsigned distance = ((input[0] & 15) << 8 | input[1]) + 1;
+					if (distance > out) { valid = false; break; }
+					while (count-- && out < size) {
+						data[out] = data[out - distance];
+						++out;
+					}
+				} else {
+					input = _hgxResource(renderer->d.p, source + cursor++, 1);
+					if (!input) { valid = false; break; }
+					data[out++] = *input;
+				}
+			}
+		}
+		if (!valid) { free(data); return NULL; }
+		renderer->hgxDecoded[slot] = data;
+		renderer->hgxSizes[slot] = size;
+	}
+	size_t offset = tileIndex * 32;
+	if (offset > renderer->hgxSizes[slot] || renderer->hgxSizes[slot] - offset < 32) { return NULL; }
+	return renderer->hgxDecoded[slot] + offset;
+}
+
+static bool _drawBackgroundHGX(struct GBAVideoSoftwareRenderer* renderer,
+                              struct GBAVideoSoftwareBackground* background, int y) {
+	struct GBA* gba = renderer->d.p;
+	if (!gba || !gba->memory.rom || gba->memory.romSize < 0xBC || background->size || background->multipalette) {
+		return false;
+	}
+	const uint8_t* rom = (const uint8_t*) gba->memory.rom;
+	if (rom[0xB5] != 'H' || rom[0xB6] != 'G' || rom[0xB7] != 'X') {
+		return false;
+	}
+	uint32_t address;
+	LOAD_32(address, 0xB8, rom);
+	if (address == 0x040003E0) {
+		address = gba->memory.io[0x1F0] | ((uint32_t) gba->memory.io[0x1F1] << 16);
+	}
+	if ((address & 3) || address < 0x02000000 || address > 0x0203FFE0) {
+		return false;
+	}
+	const uint8_t* descriptor = _hgxResource(gba, address, 32);
+	uint32_t magic, mask;
+	LOAD_32(magic, 0, descriptor);
+	LOAD_32(mask, 4, descriptor);
+	if (magic != 0x32584748 || !(mask & (1U << background->index))) {
+		return false;
+	}
+	LOAD_32(address, 8 + 4 * background->index, descriptor);
+	const uint8_t* entries = _hgxResource(gba, address, 12288);
+	if (!entries || (address & 3)) {
+		return false;
+	}
+	int mosaicH = 1;
+	if (background->mosaic) {
+		int mosaicV = GBAMosaicControlGetBgV(renderer->mosaic) + 1;
+		y -= y % mosaicV;
+		mosaicH = GBAMosaicControlGetBgH(renderer->mosaic) + 1;
+	}
+	uint32_t fade;
+	LOAD_32(fade, 28, descriptor);
+	unsigned fadeY = (fade >> 16) & 31;
+	if (fadeY > 16) { fadeY = 16; }
+	unsigned inY = (y + background->y - background->offsetY) & 255;
+	bool objwin = GBARegisterDISPCNTIsObjwinEnable(renderer->dispcnt);
+	for (int x = renderer->start; x < renderer->end; ++x) {
+		uint32_t current = renderer->row[x];
+		if (!IS_WRITABLE(current)) {
+			continue;
+		}
+		if (objwin && !background->objwinForceEnable && (!(current & FLAG_OBJWIN)) != background->objwinOnly) {
+			continue;
+		}
+		unsigned inX = (x - x % mosaicH + background->x - background->offsetX) & 255;
+		unsigned index = (inY >> 3) * 32 + (inX >> 3);
+		uint32_t tileAddress, paletteAddress, resourceFlags;
+		LOAD_32(tileAddress, index * 12, entries);
+		LOAD_32(paletteAddress, index * 12 + 4, entries);
+		LOAD_32(resourceFlags, index * 12 + 8, entries);
+		const uint8_t* tile = NULL;
+		uint16_t nativeEntry;
+		LOAD_16(nativeEntry, background->screenBase + index * 2, renderer->d.vram);
+		bool nativeMatches = !(resourceFlags & 0x40000000) || nativeEntry == ((resourceFlags >> 10) & 65535);
+		if (tileAddress && nativeMatches) {
+			tile = resourceFlags & 0x80000000
+			    ? _hgxLZTile(renderer, tileAddress & ~3U, resourceFlags & 1023)
+			    : _hgxResource(gba, tileAddress & ~3U, 32);
+		}
+		const uint8_t* palette = _hgxResource(gba, paletteAddress, 32);
+		unsigned tx = inX & 7;
+		unsigned ty = inY & 7;
+		unsigned color;
+		bool useVariant = renderer->blendEffect == BLEND_BRIGHTEN || renderer->blendEffect == BLEND_DARKEN;
+		if (objwin && (current & FLAG_OBJWIN)) {
+			useVariant = useVariant && background->target1 && GBAWindowControlIsBlendEnable(renderer->objwin.packed);
+		} else {
+			useVariant = useVariant && background->variant;
+		}
+		if ((current & (FLAG_IS_BACKGROUND | FLAG_REBLEND)) == FLAG_REBLEND && !(objwin && (current & FLAG_OBJWIN))) {
+			useVariant = false;
+		}
+		if (tile && palette && !(paletteAddress & 1)) {
+			if (tileAddress & 1) { tx ^= 7; }
+			if (tileAddress & 2) { ty ^= 7; }
+			unsigned pixel = (tile[ty * 4 + (tx >> 1)] >> ((tx & 1) * 4)) & 15;
+			if (!pixel) { continue; }
+			uint16_t raw;
+			LOAD_16(raw, pixel * 2, palette);
+			if (fadeY) {
+				unsigned faded = 0;
+				for (unsigned shift = 0; shift < 15; shift += 5) {
+					unsigned a = (raw >> shift) & 31;
+					unsigned b = (fade >> shift) & 31;
+					faded |= ((a * (16 - fadeY) + b * fadeY) >> 4) << shift;
+				}
+				raw = faded;
+			}
+			color = mColorFrom555(raw);
+			if (useVariant) {
+				color = renderer->blendEffect == BLEND_BRIGHTEN ? _brighten(color, renderer->bldy) : _darken(color, renderer->bldy);
+			}
+			if (renderer->d.highlightAmount && background->highlight) {
+				unsigned amount = renderer->d.highlightAmount >> 4;
+				color = mColorMix5Bit(16 - amount, color, amount, renderer->d.highlightColor);
+			}
+		} else {
+			uint16_t native;
+			LOAD_16(native, background->screenBase + index * 2, renderer->d.vram);
+			if (native & 0x400) { tx ^= 7; }
+			if (native & 0x800) { ty ^= 7; }
+			unsigned offset = background->charBase + (native & 1023) * 32 + ty * 4 + (tx >> 1);
+			if (offset >= 0x10000) { continue; }
+			unsigned pixel = (((const uint8_t*) renderer->d.vram)[offset] >> ((tx & 1) * 4)) & 15;
+			if (!pixel) { continue; }
+			unsigned paletteIndex = (native >> 12) * 16 + pixel;
+			mColor* nativePalette = useVariant ? renderer->variantPalette : renderer->normalPalette;
+			if (renderer->d.highlightAmount && background->highlight) {
+				nativePalette = useVariant ? renderer->highlightVariantPalette : renderer->highlightPalette;
+			}
+			color = nativePalette[paletteIndex];
+		}
+		uint32_t flags = objwin && (current & FLAG_OBJWIN) ? background->objwinFlags : background->flags;
+		if (objwin) {
+			if (flags & FLAG_TARGET_2) {
+				_compositeBlendObjwin(renderer, &renderer->row[x], color | flags, current);
+			} else {
+				_compositeNoBlendObjwin(renderer, &renderer->row[x], color | flags, current);
+			}
+		} else if (flags & FLAG_TARGET_2) {
+			_compositeBlendNoObjwin(renderer, &renderer->row[x], color | flags, current);
+		} else {
+			_compositeNoBlendNoObjwin(renderer, &renderer->row[x], color | flags, current);
+		}
+	}
+	return true;
+}
+
 void GBAVideoSoftwareRendererDrawBackgroundMode0(struct GBAVideoSoftwareRenderer* renderer, struct GBAVideoSoftwareBackground* background, int y) {
+	if (_drawBackgroundHGX(renderer, background, y)) {
+		return;
+	}
 	int inX = (renderer->start + background->x - background->offsetX) & 0x1FF;
 	int length = renderer->end - renderer->start;
 	if (background->mosaic) {

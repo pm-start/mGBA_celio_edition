@@ -81,6 +81,11 @@ struct Window {
 
 struct GBAVideoSoftwareRenderer {
 	struct GBAVideoRenderer d;
+	/* Host-only, rebuildable LZ resources for HGX2. No virtual IDs enter states. */
+	uint8_t* hgxDecoded[64];
+	uint32_t hgxSources[64];
+	size_t hgxSizes[64];
+	unsigned hgxNext;
 
 	mColor* outputBuffer;
 	int outputBufferStride;

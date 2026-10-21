@@ -195,6 +195,15 @@ struct mVideoLogContext;
 
 #define LOGO_CRC32 0xD0BEB55E
 
+/* HGX reads live RAM resources: GPU and asynchronous video paths cannot
+ * reproduce it. Select the software renderer only for explicitly tagged ROMs. */
+static bool _GBACoreIsHGX(const struct GBA* gba) {
+	if (!gba) { return false; }
+	const uint8_t* rom = (const uint8_t*) gba->memory.rom;
+	return rom && gba->memory.romSize >= 0xBC
+	    && rom[0xB5] == 'H' && rom[0xB6] == 'G' && rom[0xB7] == 'X';
+}
+
 struct GBACore {
 	struct mCore d;
 	struct GBAVideoRenderer dummyRenderer;
@@ -338,6 +347,7 @@ static bool _GBACoreSupportsFeature(const struct mCore* core, enum mCoreFeature 
 	UNUSED(core);
 	switch (feature) {
 	case mCORE_FEATURE_OPENGL:
+		if (_GBACoreIsHGX(core->board)) { return false; }
 #ifdef BUILD_GLES3
 		return true;
 #else
@@ -465,7 +475,7 @@ static void _GBACoreReloadConfigOption(struct mCore* core, const char* option, c
 			mCoreConfigCopyValue(&core->config, config, "videoScale");
 		}
 		bool value;
-		if (gbacore->glRenderer.outputTex != (unsigned) -1 && mCoreConfigGetBoolValue(&core->config, "hwaccelVideo", &value) && value) {
+		if (!_GBACoreIsHGX(gba) && gbacore->glRenderer.outputTex != (unsigned) -1 && mCoreConfigGetBoolValue(&core->config, "hwaccelVideo", &value) && value) {
 			int scale;
 			mCoreConfigGetIntValue(config, "videoScale", &scale);
 			GBAVideoGLRendererSetScale(&gbacore->glRenderer, scale);
@@ -480,7 +490,7 @@ static void _GBACoreReloadConfigOption(struct mCore* core, const char* option, c
 		}
 #ifdef BUILD_GLES3
 		bool value;
-		if (gbacore->glRenderer.outputTex != (unsigned) -1 && mCoreConfigGetBoolValue(&core->config, "hwaccelVideo", &value) && value) {
+		if (!_GBACoreIsHGX(gba) && gbacore->glRenderer.outputTex != (unsigned) -1 && mCoreConfigGetBoolValue(&core->config, "hwaccelVideo", &value) && value) {
 			mCoreConfigGetIntValue(&core->config, "videoScale", &gbacore->glRenderer.scale);
 			renderer = &gbacore->glRenderer.d;
 		} else {
@@ -488,7 +498,7 @@ static void _GBACoreReloadConfigOption(struct mCore* core, const char* option, c
 		}
 #endif
 #ifndef MINIMAL_CORE
-		if (renderer && core->videoLogger) {
+		if (!_GBACoreIsHGX(gba) && renderer && core->videoLogger) {
 			GBAVideoProxyRendererCreate(&gbacore->proxyRenderer, renderer, core->videoLogger);
 			renderer = &gbacore->proxyRenderer.d;
 		}
@@ -769,7 +779,7 @@ static void _GBACoreReset(struct mCore* core) {
 			renderer = &gbacore->renderer.d;
 		}
 #ifdef BUILD_GLES3
-		if (gbacore->glRenderer.outputTex != (unsigned) -1 && mCoreConfigGetBoolValue(&core->config, "hwaccelVideo", &value) && value) {
+		if (!_GBACoreIsHGX(gba) && gbacore->glRenderer.outputTex != (unsigned) -1 && mCoreConfigGetBoolValue(&core->config, "hwaccelVideo", &value) && value) {
 			mCoreConfigGetIntValue(&core->config, "videoScale", &gbacore->glRenderer.scale);
 			renderer = &gbacore->glRenderer.d;
 		} else {
@@ -777,14 +787,14 @@ static void _GBACoreReset(struct mCore* core) {
 		}
 #endif
 #ifndef DISABLE_THREADING
-		if (mCoreConfigGetBoolValue(&core->config, "threadedVideo", &value) && value) {
+		if (!_GBACoreIsHGX(gba) && mCoreConfigGetBoolValue(&core->config, "threadedVideo", &value) && value) {
 			if (!core->videoLogger) {
 				core->videoLogger = &gbacore->threadProxy.d;
 			}
 		}
 #endif
 #ifndef MINIMAL_CORE
-		if (renderer && core->videoLogger) {
+		if (!_GBACoreIsHGX(gba) && renderer && core->videoLogger) {
 			GBAVideoProxyRendererCreate(&gbacore->proxyRenderer, renderer, core->videoLogger);
 			renderer = &gbacore->proxyRenderer.d;
 

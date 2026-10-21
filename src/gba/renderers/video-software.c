@@ -8,6 +8,7 @@
 #include <mgba/core/cache-set.h>
 #include <mgba/internal/arm/macros.h>
 #include <mgba/internal/gba/io.h>
+#include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/renderers/cache-set.h>
 
 #include <mgba-util/memory.h>
@@ -106,6 +107,15 @@ static void GBAVideoSoftwareRendererInit(struct GBAVideoRenderer* renderer) {
 }
 
 static void GBAVideoSoftwareRendererReset(struct GBAVideoRenderer* renderer) {
+	struct GBAVideoSoftwareRenderer* hgx = (struct GBAVideoSoftwareRenderer*) renderer;
+	for (unsigned n = 0; n < 64; ++n) {
+		free(hgx->hgxDecoded[n]);
+		hgx->hgxDecoded[n] = NULL;
+		hgx->hgxSources[n] = 0;
+		hgx->hgxSizes[n] = 0;
+	}
+	hgx->hgxNext = 0;
+
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	int i;
 
@@ -159,6 +169,14 @@ static void GBAVideoSoftwareRendererReset(struct GBAVideoRenderer* renderer) {
 }
 
 static void GBAVideoSoftwareRendererDeinit(struct GBAVideoRenderer* renderer) {
+	struct GBAVideoSoftwareRenderer* hgx = (struct GBAVideoSoftwareRenderer*) renderer;
+	for (unsigned n = 0; n < 64; ++n) {
+		free(hgx->hgxDecoded[n]);
+		hgx->hgxDecoded[n] = NULL;
+		hgx->hgxSources[n] = 0;
+		hgx->hgxSizes[n] = 0;
+	}
+
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	UNUSED(softwareRenderer);
 }
@@ -568,6 +586,13 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 	}
 
 	bool dirty = softwareRenderer->scanlineDirty[y >> 5] & (1U << (y & 0x1F));
+	/* HGX maps live in RAM/ROM, outside VRAM write invalidation. */
+	if (renderer->p && renderer->p->memory.romSize >= 0xBC) {
+		const uint8_t* rom = (const uint8_t*) renderer->p->memory.rom;
+		if (rom[0xB5] == 'H' && rom[0xB6] == 'G' && rom[0xB7] == 'X') {
+			dirty = true;
+		}
+	}
 	if (memcmp(softwareRenderer->nextIo, softwareRenderer->cache[y].io, sizeof(softwareRenderer->nextIo))) {
 		memcpy(softwareRenderer->cache[y].io, softwareRenderer->nextIo, sizeof(softwareRenderer->nextIo));
 		dirty = true;
