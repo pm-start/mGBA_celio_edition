@@ -824,7 +824,7 @@ uint16_t GBAIORead(struct GBA* gba, uint32_t address) {
 		return gba->sioMask->mask;
 	}
 
-	case GBA_REG_RCNT:
+case GBA_REG_RCNT:
 		return gba->sio.rcnt;
 
 	case GBA_REG_BG0HOFS:
