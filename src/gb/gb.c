@@ -206,13 +206,26 @@ bool GBLoadROM(struct GB* gb, struct VFile* vf) {
 
 	gb->romVf = vf;
 	vf->seek(vf, 0, SEEK_SET);
-	gb->isPristine = true;
-	gb->memory.rom = vf->map(vf, gb->pristineRomSize, MAP_READ);
-	if (!gb->memory.rom) {
-		return false;
+	if (gb->pristineRomSize > GB_SIZE_CART_MAX) {
+		gb->pristineRomSize = GB_SIZE_CART_MAX;
+	}
+	if (gb->pristineRomSize < GB_SIZE_CART_BANK0) {
+		gb->isPristine = false;
+		gb->memory.rom = anonymousMemoryMap(GB_SIZE_CART_MAX);
+		gb->memory.romSize = GB_SIZE_CART_BANK0;
+		if (vf->read(vf, gb->memory.rom, gb->pristineRomSize) < (ssize_t) gb->pristineRomSize) {
+			mappedMemoryFree(gb->memory.rom, GB_SIZE_CART_MAX);
+			return false;
+		}
+	} else {
+		gb->isPristine = true;
+		gb->memory.rom = vf->map(vf, gb->pristineRomSize, MAP_READ);
+		if (!gb->memory.rom) {
+			return false;
+		}
+		gb->memory.romSize = gb->pristineRomSize;
 	}
 	gb->yankedRomSize = 0;
-	gb->memory.romSize = gb->pristineRomSize;
 	gb->romCrc32 = doCrc32(gb->memory.rom, gb->memory.romSize);
 	GBMBCReset(gb);
 
@@ -988,9 +1001,6 @@ void GBProcessEvents(struct SM83Core* cpu) {
 
 			nextEvent = cycles;
 			do {
-#ifdef ENABLE_DEBUGGERS
-				gb->timing.globalCycles += nextEvent;
-#endif
 				nextEvent = mTimingTick(&gb->timing, nextEvent);
 			} while (gb->cpuBlocked);
 			// This loop cannot early exit until the SM83 run loop properly handles mid-M-cycle-exits
@@ -1208,7 +1218,7 @@ void GBFrameEnded(struct GB* gb) {
 	struct mRumble* rumble = gb->memory.rumble;
 	if (rumble && rumble->integrate) {
 		gb->memory.lastRumble = mTimingCurrentTime(&gb->timing);
-		rumble->integrate(rumble, GB_VIDEO_TOTAL_LENGTH);
+		rumble->integrate(rumble, GB_VIDEO_TOTAL_LENGTH << 1);
 	}
 
 	// TODO: Move to common code

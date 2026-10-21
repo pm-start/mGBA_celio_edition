@@ -42,11 +42,15 @@ struct SDL_JoystickCombo {
 
 DECLARE_VECTOR(SDL_JoystickList, struct SDL_JoystickCombo);
 
+struct mSDLUniqueJoystick {
+	const char* type;
+	const char* serial;
+};
+
 struct mSDLPlayer;
 struct mSDLEvents {
 	struct SDL_JoystickList joysticks;
-	const char* preferredJoysticks[MAX_PLAYERS];
-	int playersAttached;
+	struct mSDLUniqueJoystick preferredJoysticks[MAX_PLAYERS];
 	struct mSDLPlayer* players[MAX_PLAYERS];
 #if SDL_VERSION_ATLEAST(2, 0, 0)
 	int screensaverSuspendDepth;
@@ -98,10 +102,11 @@ struct mSDLPlayer {
 bool mSDLInitEvents(struct mSDLEvents*);
 void mSDLDeinitEvents(struct mSDLEvents*);
 
-bool mSDLAttachPlayer(struct mSDLEvents*, struct mSDLPlayer*);
+bool mSDLAttachPlayer(struct mSDLEvents*, struct mSDLPlayer*, int playerId);
 void mSDLDetachPlayer(struct mSDLEvents*, struct mSDLPlayer*);
 void mSDLEventsLoadConfig(struct mSDLEvents*, const struct Configuration*);
 void mSDLPlayerChangeJoystick(struct mSDLEvents*, struct mSDLPlayer*, size_t index);
+void mSDLPlayerChangeId(struct mSDLEvents*, struct mSDLPlayer*, int id);
 void mSDLUpdateJoysticks(struct mSDLEvents* events, const struct Configuration*);
 
 void mSDLPlayerLoadConfig(struct mSDLPlayer*, const struct Configuration*);

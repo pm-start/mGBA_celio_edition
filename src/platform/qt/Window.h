@@ -70,6 +70,8 @@ public:
 
 	InputController* inputController() { return &m_inputController; }
 
+	QSize contentSize(bool fallback) const;
+
 signals:
 	void startDrawing();
 	void shutdown();
@@ -77,7 +79,7 @@ signals:
 	void shaderSelectorAdded(ShaderSelector*);
 
 public slots:
-	void setController(CoreController* controller, const QString& fname);
+	void setController(CoreController* controller);
 	void selectROM();
 	void bootBIOS();
 #ifdef USE_SQLITE3
@@ -183,6 +185,7 @@ private:
 	void updateMRU();
 
 	void ensureScripting();
+	void recalculateFrameSize(const QSize&);
 
 	template <typename T, typename... A> std::function<void()> openTView(A... arg);
 	template <typename T, typename... A> std::function<void()> openControllerTView(A... arg);

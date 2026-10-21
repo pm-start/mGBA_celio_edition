@@ -18,7 +18,6 @@
 
 #ifndef DISABLE_THREADING
 
-static const float _defaultFPSTarget = 60.f;
 static ThreadLocal _contextKey;
 
 #ifdef USE_PTHREADS
@@ -148,13 +147,19 @@ void _frameStarted(void* context) {
 		return;
 	}
 	if (thread->core->opts.rewindEnable && thread->core->opts.rewindBufferCapacity > 0) {
-		if (!thread->impl->rewinding || !mCoreRewindRestore(&thread->impl->rewind, thread->core, 1)) {
+		MutexLock(&thread->impl->stateMutex);
+		if (thread->impl->rewinding) {
+			if (!mCoreRewindRestore(&thread->impl->rewind, thread->core, 1)) {
+				_sendRequest(thread->impl, mTHREAD_REQ_REWIND_EMPTY);
+			}
+		} else {
 			if (thread->impl->rewind.rewindFrameCounter == 0) {
 				mCoreRewindAppend(&thread->impl->rewind, thread->core);
 				thread->impl->rewind.rewindFrameCounter = thread->core->opts.rewindBufferInterval;
 			}
 			thread->impl->rewind.rewindFrameCounter--;
 		}
+		MutexUnlock(&thread->impl->stateMutex);
 	}
 }
 
@@ -334,7 +339,7 @@ static THREAD_ENTRY _mCoreThreadRun(void* context) {
 			}
 		}
 
-		impl->requested &= ~pendingRequests | mTHREAD_REQ_PAUSE | mTHREAD_REQ_WAIT | mTHREAD_REQ_CRASHED;
+		impl->requested &= ~pendingRequests | mTHREAD_REQ_PAUSE | mTHREAD_REQ_WAIT | mTHREAD_REQ_CRASHED | mTHREAD_REQ_REWIND_EMPTY;
 		pendingRequests = impl->requested;
 
 		if (impl->state == mTHREAD_REQUEST) {
@@ -347,6 +352,9 @@ static THREAD_ENTRY _mCoreThreadRun(void* context) {
 				}
 				if (pendingRequests & mTHREAD_REQ_CRASHED) {
 					_changeState(impl, mTHREAD_CRASHED);
+				}
+				if (pendingRequests & mTHREAD_REQ_REWIND_EMPTY) {
+					_changeState(impl, mTHREAD_PAUSED);
 				}
 			} else {
 				_changeState(impl, mTHREAD_RUNNING);
@@ -423,10 +431,6 @@ bool mCoreThreadStart(struct mCoreThread* threadContext) {
 	threadContext->logger.d.log = _mCoreLog;
 	threadContext->logger.d.filter = NULL;
 
-	if (!threadContext->impl->sync.fpsTarget) {
-		threadContext->impl->sync.fpsTarget = _defaultFPSTarget;
-	}
-
 	MutexInit(&threadContext->impl->stateMutex);
 	ConditionInit(&threadContext->impl->stateOnThreadCond);
 	ConditionInit(&threadContext->impl->stateOffThreadCond);
@@ -447,10 +451,7 @@ bool mCoreThreadStart(struct mCoreThread* threadContext) {
 	pthread_sigmask(SIG_BLOCK, &signals, 0);
 #endif
 
-	threadContext->impl->sync.audioWait = threadContext->core->opts.audioSync;
-	threadContext->impl->sync.videoFrameWait = threadContext->core->opts.videoSync;
-	threadContext->impl->sync.fpsTarget = threadContext->core->opts.fpsTarget;
-	threadContext->impl->sync.audioHighWater = 512;
+	mCoreSyncLoadCoreOpts(&threadContext->impl->sync, &threadContext->core->opts);
 
 	MutexLock(&threadContext->impl->stateMutex);
 	ThreadCreate(&threadContext->impl->thread, _mCoreThreadRun, threadContext);
@@ -682,6 +683,9 @@ void mCoreThreadSetRewinding(struct mCoreThread* threadContext, bool rewinding) 
 	if (rewinding && threadContext->impl->state == mTHREAD_CRASHED) {
 		threadContext->impl->state = mTHREAD_REQUEST;
 		ConditionWake(&threadContext->impl->stateOnThreadCond);
+	}
+	if (!rewinding) {
+		_cancelRequest(threadContext->impl, mTHREAD_REQ_REWIND_EMPTY);
 	}
 	MutexUnlock(&threadContext->impl->stateMutex);
 }

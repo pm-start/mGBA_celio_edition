@@ -33,6 +33,7 @@ public:
 	mLogFilter* filter() { return &m_filter; }
 
 	static LogController* global();
+	static void installGlobalLogger();
 	static QtMessageHandler installMessageHandler();
 	static QString toString(int level);
 	static int categoryId(const char*);
@@ -71,6 +72,9 @@ public slots:
 	void setLogFile(const QString&);
 
 private:
+	struct Logger : public mLogger {
+		LogController* self;
+	} m_logger{};
 	mLogFilter m_filter;
 	bool m_logToFile = false;
 	bool m_logToStdout = false;

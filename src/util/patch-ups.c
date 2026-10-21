@@ -20,8 +20,8 @@ enum {
 
 static size_t _UPSOutputSize(struct Patch* patch, size_t inSize);
 
-static bool _UPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* out, size_t outSize);
-static bool _BPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* out, size_t outSize);
+static bool _UPSApplyPatch(struct Patch* patch, const void* restrict in, size_t inSize, void* restrict out, size_t outSize);
+static bool _BPSApplyPatch(struct Patch* patch, const void* restrict in, size_t inSize, void* restrict out, size_t outSize);
 
 static size_t _decodeLength(struct VFile* vf, struct mCircleBuffer* buffer);
 
@@ -67,7 +67,7 @@ size_t _UPSOutputSize(struct Patch* patch, size_t inSize) {
 	return _decodeLength(patch->vf, NULL);
 }
 
-bool _UPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* out, size_t outSize) {
+bool _UPSApplyPatch(struct Patch* patch, const void* restrict in, size_t inSize, void* restrict out, size_t outSize) {
 	// TODO: Input checksum
 
 	size_t filesize = patch->vf->size(patch->vf);
@@ -131,7 +131,7 @@ bool _UPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* ou
 	return true;
 }
 
-bool _BPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* out, size_t outSize) {
+bool _BPSApplyPatch(struct Patch* patch, const void* restrict in, size_t inSize, void* restrict out, size_t outSize) {
 	patch->vf->seek(patch->vf, IN_CHECKSUM, SEEK_END);
 	uint32_t expectedInChecksum;
 	uint32_t expectedOutChecksum;
@@ -151,7 +151,7 @@ bool _BPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* ou
 	if (_decodeLength(patch->vf, NULL) != outSize) {
 		return false;
 	}
-	if (inSize > SSIZE_MAX || outSize > SSIZE_MAX) {
+	if (inSize > (size_t) SSIZE_MAX || outSize > (size_t) SSIZE_MAX) {
 		return false;
 	}
 	size_t metadataLength = _decodeLength(patch->vf, NULL);
@@ -172,6 +172,9 @@ bool _BPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* ou
 		switch (command & 0x3) {
 		case 0x0:
 			// SourceRead
+			if (writeLocation + length > inSize) {
+				return false;
+			}
 			memmove(&writeBuffer[writeLocation], &readBuffer[writeLocation], length);
 			outputChecksum = crc32(outputChecksum, &writeBuffer[writeLocation], length);
 			writeLocation += length;
@@ -187,12 +190,22 @@ bool _BPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* ou
 		case 0x2:
 			// SourceCopy
 			readOffset = _decodeLength(patch->vf, NULL);
+			if (readOffset > (size_t) SSIZE_MAX) {
+				// This is outrageously large...let's just reject it instead of trying to be careful with overflows
+				return false;
+			}
 			if (readOffset & 1) {
 				readSourceLocation -= readOffset >> 1;
 			} else {
 				readSourceLocation += readOffset >> 1;
 			}
-			if (readSourceLocation < 0 || readSourceLocation > (ssize_t) inSize) {
+			if (readSourceLocation < 0) {
+				return false;
+			}
+			if (readSourceLocation > (ssize_t) inSize) {
+				return false;
+			}
+			if (readSourceLocation + length > inSize) {
 				return false;
 			}
 			memmove(&writeBuffer[writeLocation], &readBuffer[readSourceLocation], length);
@@ -203,12 +216,22 @@ bool _BPSApplyPatch(struct Patch* patch, const void* in, size_t inSize, void* ou
 		case 0x3:
 			// TargetCopy
 			readOffset = _decodeLength(patch->vf, NULL);
+			if (readOffset > (size_t) SSIZE_MAX) {
+				// This is outrageously large...let's just reject it instead of trying to be careful with overflows
+				return false;
+			}
 			if (readOffset & 1) {
 				readTargetLocation -= readOffset >> 1;
 			} else {
 				readTargetLocation += readOffset >> 1;
 			}
-			if (readTargetLocation < 0 || readTargetLocation > (ssize_t) outSize) {
+			if (readTargetLocation < 0) {
+				return false;
+			}
+			if (readTargetLocation > (ssize_t) outSize) {
+				return false;
+			}
+			if (readTargetLocation + length > outSize) {
 				return false;
 			}
 			for (i = 0; i < length; ++i) {
