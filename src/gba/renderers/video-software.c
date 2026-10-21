@@ -8,6 +8,7 @@
 #include <mgba/core/cache-set.h>
 #include <mgba/internal/arm/macros.h>
 #include <mgba/internal/gba/io.h>
+#include <mgba/internal/gba/gba.h>
 #include <mgba/internal/gba/renderers/cache-set.h>
 
 #include <mgba-util/memory.h>
@@ -88,6 +89,7 @@ void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer) {
 	renderer->d.highlightAmount = 0;
 
 	renderer->temporaryBuffer = NULL;
+	renderer->hgx4 = NULL;
 }
 
 static void GBAVideoSoftwareRendererInit(struct GBAVideoRenderer* renderer) {
@@ -106,6 +108,25 @@ static void GBAVideoSoftwareRendererInit(struct GBAVideoRenderer* renderer) {
 }
 
 static void GBAVideoSoftwareRendererReset(struct GBAVideoRenderer* renderer) {
+	struct GBAVideoSoftwareRenderer* hgx = (struct GBAVideoSoftwareRenderer*) renderer;
+	GBAVideoSoftwareRendererResetHGX4(hgx);
+	for (unsigned n = 0; n < 64; ++n) {
+		free(hgx->hgxDecoded[n]);
+		hgx->hgxDecoded[n] = NULL;
+		hgx->hgxSources[n] = 0;
+		hgx->hgxSizes[n] = 0;
+	}
+	hgx->hgxNext = 0;
+	hgx->hgxFrameStarted = false;
+	hgx->hgxFrameValid = false;
+	hgx->hgxFrameHasBinding = false;
+	hgx->hgxCoherentSeen = false;
+	hgx->hgxCoherentFrame = false;
+	hgx->hgxHoldFrame = false;
+	hgx->hgxHoldRestored = false;
+	hgx->hgxCompletedFrame = false;
+	hgx->hgxPreviousValid = false;
+
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	int i;
 
@@ -159,6 +180,18 @@ static void GBAVideoSoftwareRendererReset(struct GBAVideoRenderer* renderer) {
 }
 
 static void GBAVideoSoftwareRendererDeinit(struct GBAVideoRenderer* renderer) {
+	struct GBAVideoSoftwareRenderer* hgx = (struct GBAVideoSoftwareRenderer*) renderer;
+	GBAVideoSoftwareRendererResetHGX4(hgx);
+	free(hgx->hgxPreviousFrame);
+	hgx->hgxPreviousFrame = NULL;
+	hgx->hgxPreviousValid = false;
+	for (unsigned n = 0; n < 64; ++n) {
+		free(hgx->hgxDecoded[n]);
+		hgx->hgxDecoded[n] = NULL;
+		hgx->hgxSources[n] = 0;
+		hgx->hgxSizes[n] = 0;
+	}
+
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	UNUSED(softwareRenderer);
 }
@@ -558,8 +591,71 @@ static void GBAVideoSoftwareRendererPrepareWindow(struct GBAVideoSoftwareRendere
 	}
 }
 
+static bool _hgxStoreCompleted(struct GBAVideoSoftwareRenderer* renderer) {
+	if (!renderer->outputBuffer) { return false; }
+	if (!renderer->hgxPreviousFrame) {
+		renderer->hgxPreviousFrame = malloc(GBA_VIDEO_HORIZONTAL_PIXELS * GBA_VIDEO_VERTICAL_PIXELS * sizeof(mColor));
+		if (!renderer->hgxPreviousFrame) { return false; }
+	}
+	for (unsigned y = 0; y < GBA_VIDEO_VERTICAL_PIXELS; ++y) {
+		memcpy(renderer->hgxPreviousFrame + y * GBA_VIDEO_HORIZONTAL_PIXELS,
+		       renderer->outputBuffer + y * renderer->outputBufferStride,
+		       GBA_VIDEO_HORIZONTAL_PIXELS * sizeof(mColor));
+	}
+	renderer->hgxPreviousValid = true;
+	return true;
+}
+
+/* Hold a complete image, including OBJ/windows/scroll, while guest resources
+ * are being rebuilt. Restoring the whole framebuffer also retracts any lines
+ * drawn before an odd epoch was first observed in the middle of a frame.
+ * Resume only at scanline zero; legacy HGX2/HGX3 and ordinary ROMs opt out. */
+static bool _hgxHoldTransaction(struct GBAVideoSoftwareRenderer* renderer, int y) {
+	uint32_t descriptor = 0, epoch = 0;
+	bool coherent = GBAVideoSoftwareRendererHGXEpoch(renderer, &descriptor, &epoch);
+	if (coherent) { renderer->hgxCoherentSeen = true; }
+	if (!y) {
+		renderer->hgxHoldFrame = false;
+		renderer->hgxHoldRestored = false;
+		renderer->hgxCompletedFrame = false;
+		renderer->hgxCoherentFrame = coherent;
+		renderer->hgxCoherentDescriptor = descriptor;
+		renderer->hgxCoherentEpoch = epoch;
+	}
+	if (coherent) {
+		if ((epoch & 1) || !renderer->hgxCoherentFrame
+		    || descriptor != renderer->hgxCoherentDescriptor || epoch != renderer->hgxCoherentEpoch) {
+			renderer->hgxHoldFrame = true;
+		}
+	} else if (renderer->hgxCoherentFrame) {
+		renderer->hgxHoldFrame = true;
+	}
+	if (!renderer->hgxHoldFrame) { return false; }
+	if (!renderer->hgxHoldRestored && renderer->outputBuffer) {
+		for (unsigned row = 0; row < GBA_VIDEO_VERTICAL_PIXELS; ++row) {
+			mColor* output = renderer->outputBuffer + row * renderer->outputBufferStride;
+			if (renderer->hgxPreviousValid) {
+				memcpy(output, renderer->hgxPreviousFrame + row * GBA_VIDEO_HORIZONTAL_PIXELS,
+				       GBA_VIDEO_HORIZONTAL_PIXELS * sizeof(mColor));
+			} else {
+				/* No complete image exists yet (first boot/state without PNG).
+				 * A uniform backdrop is preferable to mixed/uninitialized rows. */
+				for (unsigned x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; ++x) { output[x] = renderer->normalPalette[0]; }
+			}
+		}
+		renderer->hgxHoldRestored = true;
+	}
+	if (renderer->d.p) {
+		renderer->d.p->memory.io[0x3F2 >> 1] |= 0x8000 | (renderer->hgxPreviousValid ? 0 : 0x4000);
+	}
+	return true;
+}
+
 static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* renderer, int y) {
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
+	if (y == 0) { GBAVideoSoftwareRendererLatchHGX4(softwareRenderer); }
+	bool hold = _hgxHoldTransaction(softwareRenderer, y);
+	if (!hold && y == 0) { GBAVideoSoftwareRendererLatchHGXFrame(softwareRenderer); }
 
 	if (y == GBA_VIDEO_VERTICAL_PIXELS - 1) {
 		softwareRenderer->nextY = 0;
@@ -567,7 +663,17 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 		softwareRenderer->nextY = y + 1;
 	}
 
+	if (hold) { return; }
+	if (y == GBA_VIDEO_VERTICAL_PIXELS - 1) { softwareRenderer->hgxCompletedFrame = true; }
+
 	bool dirty = softwareRenderer->scanlineDirty[y >> 5] & (1U << (y & 0x1F));
+	/* HGX maps live in RAM/ROM, outside VRAM write invalidation. */
+	if (renderer->p && renderer->p->memory.romSize >= 0xBC) {
+		const uint8_t* rom = (const uint8_t*) renderer->p->memory.rom;
+		if (rom[0xB5] == 'H' && rom[0xB6] == 'G' && rom[0xB7] == 'X') {
+			dirty = true;
+		}
+	}
 	if (memcmp(softwareRenderer->nextIo, softwareRenderer->cache[y].io, sizeof(softwareRenderer->nextIo))) {
 		memcpy(softwareRenderer->cache[y].io, softwareRenderer->nextIo, sizeof(softwareRenderer->nextIo));
 		dirty = true;
@@ -733,6 +839,12 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 
 static void GBAVideoSoftwareRendererFinishFrame(struct GBAVideoRenderer* renderer) {
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
+	uint32_t descriptor = 0, epoch = 0;
+	bool coherent = GBAVideoSoftwareRendererHGXEpoch(softwareRenderer, &descriptor, &epoch);
+	if (!softwareRenderer->hgxHoldFrame && softwareRenderer->hgxCompletedFrame && softwareRenderer->hgxCoherentSeen
+	    && (!coherent || (!(epoch & 1) && descriptor == softwareRenderer->hgxCoherentDescriptor && epoch == softwareRenderer->hgxCoherentEpoch))) {
+		_hgxStoreCompleted(softwareRenderer);
+	}
 
 	softwareRenderer->nextY = 0;
 	if (softwareRenderer->temporaryBuffer) {
@@ -780,11 +892,19 @@ static void GBAVideoSoftwareRendererGetPixels(struct GBAVideoRenderer* renderer,
 
 static void GBAVideoSoftwareRendererPutPixels(struct GBAVideoRenderer* renderer, size_t stride, const void* pixels) {
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
+	/* A state restore changes game RAM without touching native VRAM caches. */
+	GBAVideoSoftwareRendererResetHGX4(softwareRenderer);
+	GBAVideoSoftwareRendererLatchHGX4(softwareRenderer);
 
 	const mColor* colorPixels = pixels;
 	unsigned i;
 	for (i = 0; i < GBA_VIDEO_VERTICAL_PIXELS; ++i) {
 		memmove(&softwareRenderer->outputBuffer[softwareRenderer->outputBufferStride * i], &colorPixels[stride * i], GBA_VIDEO_HORIZONTAL_PIXELS * BYTES_PER_PIXEL);
+	}
+	uint32_t descriptor, epoch;
+	if (GBAVideoSoftwareRendererHGXEpoch(softwareRenderer, &descriptor, &epoch)) {
+		softwareRenderer->hgxCoherentSeen = true;
+		_hgxStoreCompleted(softwareRenderer); /* Complete restored screenshot. */
 	}
 }
 

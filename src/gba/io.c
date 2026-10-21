@@ -12,6 +12,17 @@
 
 mLOG_DEFINE_CATEGORY(GBA_IO, "GBA I/O", "gba.io");
 
+// HGX dedicated-ROM extension. This otherwise-unused word contains a pointer
+// to a heap-owned graphics descriptor; no game RAM address is reserved.
+#define HGX_DESCRIPTOR_IO 0x3E0
+static bool _hgxIOEnabled(const struct GBA* gba) {
+	const uint8_t* rom = (const uint8_t*) gba->memory.rom;
+	return rom && gba->memory.romSize >= 0xBC
+	    && rom[0xB5] == 'H' && rom[0xB6] == 'G' && rom[0xB7] == 'X'
+	    && rom[0xB8] == 0xE0 && rom[0xB9] == 3
+	    && rom[0xBA] == 0 && rom[0xBB] == 4;
+}
+
 const char* const GBAIORegisterNames[] = {
 	// Video
 	[GBA_REG(DISPCNT)] = "DISPCNT",
@@ -298,6 +309,10 @@ void GBAIOInit(struct GBA* gba) {
 }
 
 void GBAIOWrite(struct GBA* gba, uint32_t address, uint16_t value) {
+	if ((address == HGX_DESCRIPTOR_IO || address == HGX_DESCRIPTOR_IO + 2) && _hgxIOEnabled(gba)) {
+		gba->memory.io[address >> 1] = value;
+		return;
+	}
 	if (address < GBA_REG_SOUND1CNT_LO && (address > GBA_REG_VCOUNT || address < GBA_REG_DISPSTAT)) {
 		gba->memory.io[address >> 1] = gba->video.renderer->writeVideoRegister(gba->video.renderer, address, value);
 		return;
@@ -769,6 +784,24 @@ bool GBAIOIsReadConstant(uint32_t address) {
 }
 
 uint16_t GBAIORead(struct GBA* gba, uint32_t address) {
+	/* Read-only HGX3 renderer diagnostics. These slots are unused native IO;
+	 * no values are exposed for ordinary ROMs or HGX2 descriptors. */
+	if (address >= 0x3EC && address <= 0x3FE && !(address & 1) && _hgxIOEnabled(gba)) {
+		uint32_t descriptor = gba->memory.io[0x1F0] | ((uint32_t) gba->memory.io[0x1F1] << 16);
+		if (!(descriptor & 3) && descriptor >= 0x02000000 && descriptor <= 0x0203FFD0) {
+			uint32_t magic;
+			LOAD_32(magic, descriptor - 0x02000000, gba->memory.wram);
+			if (magic == 0x33584748) { return gba->memory.io[address >> 1]; }
+		}
+	}
+	// Real BG scroll registers are write-only. Dedicated tooling needs their
+	// stored values to report the exact visible map rectangle, not open bus.
+	if ((address == 0x3E8 || address == 0x3EA) && _hgxIOEnabled(gba)) {
+		return gba->memory.io[(address == 0x3E8 ? GBA_REG_BG1HOFS : GBA_REG_BG1VOFS) >> 1];
+	}
+	if ((address == HGX_DESCRIPTOR_IO || address == HGX_DESCRIPTOR_IO + 2) && _hgxIOEnabled(gba)) {
+		return gba->memory.io[address >> 1];
+	}
 	if (!GBAIOIsReadConstant(address)) {
 		// Most IO reads need to disable idle removal
 		gba->haltPending = false;
@@ -1005,6 +1038,10 @@ case GBA_REG_RCNT:
 }
 
 void GBAIOSerialize(struct GBA* gba, struct GBASerializedState* state) {
+	if (_hgxIOEnabled(gba)) {
+		STORE_16(gba->memory.io[HGX_DESCRIPTOR_IO >> 1], HGX_DESCRIPTOR_IO, state->io);
+		STORE_16(gba->memory.io[(HGX_DESCRIPTOR_IO + 2) >> 1], HGX_DESCRIPTOR_IO + 2, state->io);
+	}
 	int i;
 	for (i = 0; i < GBA_REG_INTERNAL_MAX; i += 2) {
 		if (_isRSpecialRegister[i >> 1]) {
@@ -1029,6 +1066,10 @@ void GBAIOSerialize(struct GBA* gba, struct GBASerializedState* state) {
 }
 
 void GBAIODeserialize(struct GBA* gba, const struct GBASerializedState* state) {
+	if (_hgxIOEnabled(gba)) {
+		LOAD_16(gba->memory.io[HGX_DESCRIPTOR_IO >> 1], HGX_DESCRIPTOR_IO, state->io);
+		LOAD_16(gba->memory.io[(HGX_DESCRIPTOR_IO + 2) >> 1], HGX_DESCRIPTOR_IO + 2, state->io);
+	}
 	LOAD_16(gba->memory.io[GBA_REG(SOUNDCNT_X)], GBA_REG_SOUNDCNT_X, state->io);
 	GBAAudioWriteSOUNDCNT_X(&gba->audio, gba->memory.io[GBA_REG(SOUNDCNT_X)]);
 

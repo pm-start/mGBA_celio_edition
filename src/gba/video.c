@@ -129,6 +129,7 @@ void GBAVideoAssociateRenderer(struct GBAVideo* video, struct GBAVideoRenderer* 
 		renderer->cache = NULL;
 	}
 	video->renderer = renderer;
+	renderer->p = video->p;
 	renderer->palette = video->palette;
 	renderer->vram = video->vram;
 	renderer->oam = &video->oam;

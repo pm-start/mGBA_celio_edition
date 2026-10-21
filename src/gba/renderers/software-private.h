@@ -17,6 +17,13 @@
 
 #define ENABLED_MAX 4
 
+void GBAVideoSoftwareRendererResetHGX4(struct GBAVideoSoftwareRenderer* renderer);
+void GBAVideoSoftwareRendererLatchHGX4(struct GBAVideoSoftwareRenderer* renderer);
+bool GBAVideoSoftwareRendererDrawHGX4(struct GBAVideoSoftwareRenderer* renderer,
+                                    struct GBAVideoSoftwareBackground* background, int y);
+
+bool GBAVideoSoftwareRendererHGXEpoch(struct GBAVideoSoftwareRenderer* renderer, uint32_t* descriptor, uint32_t* epoch);
+void GBAVideoSoftwareRendererLatchHGXFrame(struct GBAVideoSoftwareRenderer* renderer);
 void GBAVideoSoftwareRendererDrawBackgroundMode0(struct GBAVideoSoftwareRenderer* renderer,
                                                  struct GBAVideoSoftwareBackground* background, int y);
 void GBAVideoSoftwareRendererDrawBackgroundMode2(struct GBAVideoSoftwareRenderer* renderer,
