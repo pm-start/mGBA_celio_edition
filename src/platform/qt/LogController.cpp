@@ -11,7 +11,11 @@
 #include <QFileInfo>
 #include <QLoggingCategory>
 #include <QMessageBox>
+#include <QMutexLocker>
 #include <QTextStream>
+#if (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
+#include <QStringConverter>
+#endif
 
 #include "ConfigController.h"
 
@@ -155,6 +159,8 @@ void LogController::postLog(int level, int category, const QString& string) {
 			QTextStream out(stdout);
 			out << line << endl;
 		}
+		// Log::Stream posts to the global logger from whichever thread logged (audio, network), so serialize file writes
+		QMutexLocker locker(&m_fileLock);
 		if (m_logToFile && m_logStream && (level & m_fileLevels)) {
 			*m_logStream << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")) << QLatin1Char(' ') << line << endl;
 		}
@@ -216,6 +222,7 @@ void LogController::logToStdout(bool log) {
 }
 
 void LogController::setLogFile(const QString& file) {
+	QMutexLocker locker(&m_fileLock);
 	m_logStream.reset();
 	m_logFile.reset();
 	QString path = file.isEmpty() ? defaultLogFile() : file;
