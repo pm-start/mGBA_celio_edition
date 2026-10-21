@@ -24,6 +24,7 @@ set(SOURCE_FILES
 	renderers/common.c
 	renderers/gl.c
 	renderers/software-bg.c
+	renderers/software-hgx4.c
 	renderers/software-mode0.c
 	renderers/software-obj.c
 	renderers/video-software.c

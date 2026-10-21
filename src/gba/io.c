@@ -789,6 +789,16 @@ bool GBAIOIsReadConstant(uint32_t address) {
 }
 
 uint16_t GBAIORead(struct GBA* gba, uint32_t address) {
+	/* Read-only HGX3 renderer diagnostics. These slots are unused native IO;
+	 * no values are exposed for ordinary ROMs or HGX2 descriptors. */
+	if (address >= 0x3EC && address <= 0x3FE && !(address & 1) && _hgxIOEnabled(gba)) {
+		uint32_t descriptor = gba->memory.io[0x1F0] | ((uint32_t) gba->memory.io[0x1F1] << 16);
+		if (!(descriptor & 3) && descriptor >= 0x02000000 && descriptor <= 0x0203FFD0) {
+			uint32_t magic;
+			LOAD_32(magic, descriptor - 0x02000000, gba->memory.wram);
+			if (magic == 0x33584748) { return gba->memory.io[address >> 1]; }
+		}
+	}
 	// Real BG scroll registers are write-only. Dedicated tooling needs their
 	// stored values to report the exact visible map rectangle, not open bus.
 	if ((address == 0x3E8 || address == 0x3EA) && _hgxIOEnabled(gba)) {

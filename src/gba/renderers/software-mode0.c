@@ -483,9 +483,17 @@
 		return; \
 	}
 
-/* HGX2 is explicitly enabled by the ROM header (reserved bytes B5..BB).
+/* HGX2/HGX3 is explicitly enabled by the ROM header (reserved bytes B5..BB).
  * Header B8 may name the HGX pointer register at 040003E0.
  * Descriptor: magic, BG mask, four screen-map pointers, generation, fade word.
+ * HGX3 extends the descriptor to 48 bytes: current binding pointer at +32,
+ * descriptor size (48) at +36, entry stride (12) at +40. Binding is an atomic
+ * pointer to {primaryTiles, secondaryTiles, primaryPalettes, secondaryPalettes}.
+ * Matching source resources are late-bound independently to live VRAM/palette
+ * RAM; foreign source resources remain ROM-resident across atlas switches.
+ * Optional +44 points at {DNS coefficient, color555, paletteMask, bindingPtr}.
+ * DNS and its binding are latched together. Only foreign nonblack palettes are
+ * tinted, before the ordinary fade; live native palette colors are final.
  * Fade word: BGR555 color in bits 0..14, coefficient 0..16 in bits 16..20.
  * Maps contain 1024 {tileAddress | hFlip | vFlip<<1, paletteAddress, resourceFlags} entries.
  * resourceFlags: bit31 = BIOS LZ77 source, low10 = decoded tile index;
@@ -571,6 +579,100 @@ static const uint8_t* _hgxLZTile(struct GBAVideoSoftwareRenderer* renderer, uint
 	return renderer->hgxDecoded[slot] + offset;
 }
 
+/* Optional HGX3 transaction capability. Legacy generation counters must never
+ * be interpreted as epochs: only environment.paletteMask bit31 opts in.
+ * Guest writes cannot interleave a software scanline on the synchronous core. */
+bool GBAVideoSoftwareRendererHGXEpoch(struct GBAVideoSoftwareRenderer* renderer, uint32_t* control, uint32_t* epoch) {
+	struct GBA* gba = renderer->d.p;
+	if (!gba || !gba->memory.rom || gba->memory.romSize < 0xBC) { return false; }
+	const uint8_t* rom = (const uint8_t*) gba->memory.rom;
+	if (rom[0xB5] != 'H' || rom[0xB6] != 'G' || rom[0xB7] != 'X') { return false; }
+	uint32_t address;
+	LOAD_32(address, 0xB8, rom);
+	if (address == 0x040003E0) { address = gba->memory.io[0x1F0] | ((uint32_t) gba->memory.io[0x1F1] << 16); }
+	if ((address & 3) || address < 0x02000000 || address > 0x0203FFD0) { return false; }
+	const uint8_t* descriptor = _hgxResource(gba, address, 48);
+	uint32_t magic, size, stride, environmentAddress, mask;
+	LOAD_32(magic, 0, descriptor);
+	LOAD_32(size, 36, descriptor);
+	LOAD_32(stride, 40, descriptor);
+	LOAD_32(environmentAddress, 44, descriptor);
+	const uint8_t* environment = _hgxResource(gba, environmentAddress, 16);
+	if (magic != 0x33584748 || size != 48 || stride != 12 || !environment || (environmentAddress & 3)) { return false; }
+	LOAD_32(mask, 8, environment);
+	if (!(mask & 0x80000000)) { return false; }
+	*control = address;
+	LOAD_32(*epoch, 24, descriptor);
+	return true;
+}
+
+/* Latch at scanline zero, after the native VBlank uploads. Reading an atomic
+ * binding pointer is not sufficient: mainloop writes can also stage individual
+ * ring entries before the native BG copy. Keep both stable for the frame.
+ * This host snapshot is rebuildable and is invalidated by renderer reset/state
+ * restore. A first draw at a nonzero line lazily captures one coherent frame. */
+void GBAVideoSoftwareRendererLatchHGXFrame(struct GBAVideoSoftwareRenderer* renderer) {
+	renderer->hgxFrameStarted = true;
+	renderer->hgxFrameValid = false;
+	renderer->hgxFrameHasBinding = false;
+	memset(renderer->hgxFrameDns, 0, sizeof(renderer->hgxFrameDns));
+	memset(renderer->hgxFrameScreenValid, 0, sizeof(renderer->hgxFrameScreenValid));
+	struct GBA* gba = renderer->d.p;
+	if (!gba || !gba->memory.rom || gba->memory.romSize < 0xBC) { return; }
+	const uint8_t* rom = (const uint8_t*) gba->memory.rom;
+	if (rom[0xB5] != 'H' || rom[0xB6] != 'G' || rom[0xB7] != 'X') { return; }
+	uint32_t address;
+	LOAD_32(address, 0xB8, rom);
+	if (address == 0x040003E0) {
+		address = gba->memory.io[0x1F0] | ((uint32_t) gba->memory.io[0x1F1] << 16);
+	}
+	if ((address & 3) || address < 0x02000000 || address > 0x0203FFD0) { return; }
+	const uint8_t* descriptor = _hgxResource(gba, address, 48);
+	uint32_t magic, mask, descriptorSize, entrySize, bindingAddress;
+	LOAD_32(magic, 0, descriptor);
+	LOAD_32(mask, 4, descriptor);
+	LOAD_32(descriptorSize, 36, descriptor);
+	LOAD_32(entrySize, 40, descriptor);
+	if (magic == 0x33584748) {
+		for (unsigned reg = 0x3EC; reg <= 0x3FE; reg += 2) { gba->memory.io[reg >> 1] = 0; }
+	}
+	if (magic != 0x33584748 || !mask || descriptorSize != 48 || entrySize != 12) { return; }
+	renderer->hgxFrameDescriptor = address;
+	LOAD_32(bindingAddress, 32, descriptor);
+	uint32_t environmentAddress;
+	LOAD_32(environmentAddress, 44, descriptor);
+	const uint8_t* environment = _hgxResource(gba, environmentAddress, 16);
+	if (environment && !(environmentAddress & 3)) {
+		uint32_t coefficient;
+		LOAD_32(coefficient, 0, environment);
+		if (coefficient <= 16) {
+			for (unsigned n = 0; n < 3; ++n) { LOAD_32(renderer->hgxFrameDns[n], n * 4, environment); }
+			LOAD_32(bindingAddress, 12, environment);
+		}
+	}
+	gba->memory.io[0x3EC >> 1] = renderer->hgxFrameDns[0];
+	gba->memory.io[0x3EE >> 1] = renderer->hgxFrameDns[1];
+	gba->memory.io[0x3F0 >> 1] = renderer->hgxFrameDns[2];
+	const uint8_t* binding = _hgxResource(gba, bindingAddress, 16);
+	if (binding && !(bindingAddress & 3)) {
+		for (unsigned n = 0; n < 4; ++n) { LOAD_32(renderer->hgxFrameBinding[n], n * 4, binding); }
+		renderer->hgxFrameHasBinding = true;
+	}
+	for (unsigned n = 0; n < 4; ++n) {
+		LOAD_32(address, 8 + n * 4, descriptor);
+		renderer->hgxFrameScreen[n] = address;
+		const uint8_t* screen = _hgxResource(gba, address, 12288);
+		if (screen && !(address & 3) && (mask & (1U << n))) {
+			memcpy(renderer->hgxFrameEntries[n], screen, 12288);
+			renderer->hgxFrameScreenValid[n] = true;
+		}
+	}
+	renderer->hgxFrameValid = true;
+	unsigned flags = 1 | (renderer->hgxFrameHasBinding ? 2 : 0);
+	for (unsigned n = 0; n < 4; ++n) { if (renderer->hgxFrameScreenValid[n]) { flags |= 16U << n; } }
+	gba->memory.io[0x3F2 >> 1] = flags;
+}
+
 static bool _drawBackgroundHGX(struct GBAVideoSoftwareRenderer* renderer,
                               struct GBAVideoSoftwareBackground* background, int y) {
 	struct GBA* gba = renderer->d.p;
@@ -589,17 +691,39 @@ static bool _drawBackgroundHGX(struct GBAVideoSoftwareRenderer* renderer,
 	if ((address & 3) || address < 0x02000000 || address > 0x0203FFE0) {
 		return false;
 	}
+	uint32_t descriptorAddress = address;
 	const uint8_t* descriptor = _hgxResource(gba, address, 32);
 	uint32_t magic, mask;
 	LOAD_32(magic, 0, descriptor);
 	LOAD_32(mask, 4, descriptor);
-	if (magic != 0x32584748 || !(mask & (1U << background->index))) {
+	if ((magic != 0x32584748 && magic != 0x33584748) || !(mask & (1U << background->index))) {
+		if (magic == 0x33584748 && !mask) { renderer->hgxFrameValid = false; gba->memory.io[0x3F2 >> 1] = 0; }
 		return false;
+	}
+	uint32_t bindingBases[4] = { 0 };
+	bool hasBinding = false;
+	if (magic == 0x33584748) {
+		if (!renderer->hgxFrameStarted) { GBAVideoSoftwareRendererLatchHGXFrame(renderer); }
+		if (!renderer->hgxFrameValid || renderer->hgxFrameDescriptor != descriptorAddress) {
+			renderer->hgxFrameValid = false;
+			gba->memory.io[0x3F2 >> 1] &= ~1U;
+			return false;
+		}
+		hasBinding = renderer->hgxFrameHasBinding;
+		memcpy(bindingBases, renderer->hgxFrameBinding, sizeof(bindingBases));
 	}
 	LOAD_32(address, 8 + 4 * background->index, descriptor);
 	const uint8_t* entries = _hgxResource(gba, address, 12288);
 	if (!entries || (address & 3)) {
 		return false;
+	}
+	if (magic == 0x33584748) {
+		if (!renderer->hgxFrameScreenValid[background->index] || renderer->hgxFrameScreen[background->index] != address) {
+			renderer->hgxFrameValid = false;
+			gba->memory.io[0x3F2 >> 1] &= ~1U;
+			return false;
+		}
+		entries = renderer->hgxFrameEntries[background->index];
 	}
 	int mosaicH = 1;
 	if (background->mosaic) {
@@ -631,10 +755,32 @@ static bool _drawBackgroundHGX(struct GBAVideoSoftwareRenderer* renderer,
 		uint16_t nativeEntry;
 		LOAD_16(nativeEntry, background->screenBase + index * 2, renderer->d.vram);
 		bool nativeMatches = !(resourceFlags & 0x40000000) || nativeEntry == ((resourceFlags >> 10) & 65535);
+		bool nativeTile = false;
+		bool nativePaletteResource = false;
+		if (hasBinding && nativeMatches && tileAddress && (resourceFlags & 0x40000000)) {
+			unsigned sourceIndex = nativeEntry & 1023;
+			unsigned tileRole = sourceIndex < 640 ? 0 : 1;
+			unsigned localIndex = sourceIndex - (tileRole ? 640 : 0);
+			uint32_t tileBase = tileAddress & ~3U;
+			if (!(resourceFlags & 0x80000000)) {
+				if (tileBase >= localIndex * 32) { tileBase -= localIndex * 32; }
+				else { tileBase = 0; }
+			}
+			nativeTile = tileBase && tileBase == bindingBases[tileRole]
+			    && (!(resourceFlags & 0x80000000) || (resourceFlags & 1023) == localIndex);
+			unsigned bank = nativeEntry >> 12;
+			uint32_t paletteBase = paletteAddress >= bank * 32 ? paletteAddress - bank * 32 : 0;
+			nativePaletteResource = paletteBase && paletteBase == bindingBases[bank < 7 ? 2 : 3];
+		}
 		if (tileAddress && nativeMatches) {
-			tile = resourceFlags & 0x80000000
-			    ? _hgxLZTile(renderer, tileAddress & ~3U, resourceFlags & 1023)
-			    : _hgxResource(gba, tileAddress & ~3U, 32);
+			if (nativeTile) {
+				unsigned offset = background->charBase + (nativeEntry & 1023) * 32;
+				if (offset <= 0x10000 - 32) { tile = (const uint8_t*) renderer->d.vram + offset; }
+			} else {
+				tile = resourceFlags & 0x80000000
+				    ? _hgxLZTile(renderer, tileAddress & ~3U, resourceFlags & 1023)
+				    : _hgxResource(gba, tileAddress & ~3U, 32);
+			}
 		}
 		const uint8_t* palette = _hgxResource(gba, paletteAddress, 32);
 		unsigned tx = inX & 7;
@@ -649,13 +795,42 @@ static bool _drawBackgroundHGX(struct GBAVideoSoftwareRenderer* renderer,
 		if ((current & (FLAG_IS_BACKGROUND | FLAG_REBLEND)) == FLAG_REBLEND && !(objwin && (current & FLAG_OBJWIN))) {
 			useVariant = false;
 		}
-		if (tile && palette && !(paletteAddress & 1)) {
+		if (tile && (nativePaletteResource || palette) && !(paletteAddress & 1)) {
 			if (tileAddress & 1) { tx ^= 7; }
 			if (tileAddress & 2) { ty ^= 7; }
 			unsigned pixel = (tile[ty * 4 + (tx >> 1)] >> ((tx & 1) * 4)) & 15;
 			if (!pixel) { continue; }
+			if (nativePaletteResource) {
+				if (gba->memory.io[0x3F6 >> 1] != 0xFFFF) { ++gba->memory.io[0x3F6 >> 1]; }
+				unsigned paletteIndex = (nativeEntry >> 12) * 16 + pixel;
+				mColor* livePalette = useVariant ? renderer->variantPalette : renderer->normalPalette;
+				if (renderer->d.highlightAmount && background->highlight) {
+					livePalette = useVariant ? renderer->highlightVariantPalette : renderer->highlightPalette;
+				}
+				color = livePalette[paletteIndex];
+			} else {
 			uint16_t raw;
 			LOAD_16(raw, pixel * 2, palette);
+			if (magic == 0x33584748 && gba->memory.io[0x3F8 >> 1] != 0xFFFF) {
+				if (!gba->memory.io[0x3F8 >> 1]) { gba->memory.io[0x3F2 >> 1] |= ((nativeEntry >> 12) + 1) << 8; }
+				++gba->memory.io[0x3F8 >> 1];
+			}
+			/* The game DNS leaves opaque black colors unchanged. Current
+			 * palettes already contain DNS/fade and never enter this path. */
+			unsigned dnsY = magic == 0x33584748 ? renderer->hgxFrameDns[0] : 0;
+			if (dnsY && (raw & 0x7FFF) && (renderer->hgxFrameDns[2] & (1U << (nativeEntry >> 12)))) {
+				bool sample = gba->memory.io[0x3F4 >> 1] == 0;
+				if (sample) { gba->memory.io[0x3FC >> 1] = raw; }
+				if (gba->memory.io[0x3F4 >> 1] != 0xFFFF) { ++gba->memory.io[0x3F4 >> 1]; }
+				unsigned tinted = 0;
+				for (unsigned shift = 0; shift < 15; shift += 5) {
+					unsigned a = (raw >> shift) & 31;
+					unsigned b = (renderer->hgxFrameDns[1] >> shift) & 31;
+					tinted |= ((a * (16 - dnsY) + b * dnsY) >> 4) << shift;
+				}
+				raw = tinted;
+				if (sample) { gba->memory.io[0x3FE >> 1] = raw; }
+			}
 			if (fadeY) {
 				unsigned faded = 0;
 				for (unsigned shift = 0; shift < 15; shift += 5) {
@@ -673,6 +848,7 @@ static bool _drawBackgroundHGX(struct GBAVideoSoftwareRenderer* renderer,
 				unsigned amount = renderer->d.highlightAmount >> 4;
 				color = mColorMix5Bit(16 - amount, color, amount, renderer->d.highlightColor);
 			}
+			}
 		} else {
 			uint16_t native;
 			LOAD_16(native, background->screenBase + index * 2, renderer->d.vram);
@@ -682,6 +858,7 @@ static bool _drawBackgroundHGX(struct GBAVideoSoftwareRenderer* renderer,
 			if (offset >= 0x10000) { continue; }
 			unsigned pixel = (((const uint8_t*) renderer->d.vram)[offset] >> ((tx & 1) * 4)) & 15;
 			if (!pixel) { continue; }
+			if (magic == 0x33584748 && gba->memory.io[0x3FA >> 1] != 0xFFFF) { ++gba->memory.io[0x3FA >> 1]; }
 			unsigned paletteIndex = (native >> 12) * 16 + pixel;
 			mColor* nativePalette = useVariant ? renderer->variantPalette : renderer->normalPalette;
 			if (renderer->d.highlightAmount && background->highlight) {
@@ -706,6 +883,9 @@ static bool _drawBackgroundHGX(struct GBAVideoSoftwareRenderer* renderer,
 }
 
 void GBAVideoSoftwareRendererDrawBackgroundMode0(struct GBAVideoSoftwareRenderer* renderer, struct GBAVideoSoftwareBackground* background, int y) {
+	if (GBAVideoSoftwareRendererDrawHGX4(renderer, background, y)) {
+		return;
+	}
 	if (_drawBackgroundHGX(renderer, background, y)) {
 		return;
 	}

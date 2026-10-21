@@ -81,11 +81,32 @@ struct Window {
 
 struct GBAVideoSoftwareRenderer {
 	struct GBAVideoRenderer d;
+	/* Independent HGX4 scene/material renderer; rebuildable host state only. */
+	struct GBAVideoHGX4* hgx4;
 	/* Host-only, rebuildable LZ resources for HGX2. No virtual IDs enter states. */
 	uint8_t* hgxDecoded[64];
 	uint32_t hgxSources[64];
 	size_t hgxSizes[64];
 	unsigned hgxNext;
+	/* HGX3 snapshots resource ownership and ring metadata after VBlank. */
+	bool hgxFrameStarted;
+	bool hgxFrameValid;
+	bool hgxFrameHasBinding;
+	uint32_t hgxFrameDescriptor;
+	uint32_t hgxFrameBinding[4];
+	uint32_t hgxFrameDns[3];
+	bool hgxCoherentSeen;
+	bool hgxCoherentFrame;
+	bool hgxHoldFrame;
+	bool hgxHoldRestored;
+	bool hgxCompletedFrame;
+	bool hgxPreviousValid;
+	uint32_t hgxCoherentDescriptor;
+	uint32_t hgxCoherentEpoch;
+	mColor* hgxPreviousFrame;
+	uint32_t hgxFrameScreen[4];
+	bool hgxFrameScreenValid[4];
+	uint8_t hgxFrameEntries[4][12288];
 
 	mColor* outputBuffer;
 	int outputBufferStride;
