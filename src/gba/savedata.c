@@ -202,7 +202,7 @@ bool GBASavedataLoad(struct GBASavedata* savedata, struct VFile* in) {
 		if (!in || savedata->type == GBA_SAVEDATA_FORCE_NONE) {
 			return false;
 		}
-		if (savedata->type == GBA_SAVEDATA_FLASH1M && !savedata->flashExt && in->size(in) > GBA_SIZE_FLASH1M) {
+		if (savedata->type == GBA_SAVEDATA_FLASH1M && !savedata->flashExt && in->size(in) >= GBA_SIZE_FLASH_EXT_1M) {
 			_flashExtend(savedata);
 		}
 		ssize_t size = GBASavedataSize(savedata);
@@ -648,11 +648,11 @@ void GBASavedataRTCWrite(struct GBASavedata* savedata) {
 	size_t size = GBASavedataSize(savedata);
 	savedata->vf->seek(savedata->vf, size & ~0xFF, SEEK_SET);
 
-	int bank = 0;
+	size_t bankOffset = 0;
 	if ((savedata->vf->size(savedata->vf) & 0xFF) != sizeof(buffer)) {
 		// Writing past the end of the file can invalidate the file mapping
-		if (savedata->type == GBA_SAVEDATA_FLASH1M) {
-			bank = savedata->currentBank == &savedata->data[0x10000];
+		if (savedata->type == GBA_SAVEDATA_FLASH1M && savedata->currentBank) {
+			bankOffset = savedata->currentBank - savedata->data;
 		}
 		savedata->vf->unmap(savedata->vf, savedata->data, size);
 		savedata->data = NULL;
@@ -661,7 +661,7 @@ void GBASavedataRTCWrite(struct GBASavedata* savedata) {
 	if (!savedata->data) {
 		savedata->data = savedata->vf->map(savedata->vf, size, MAP_WRITE);
 		if (savedata->type == GBA_SAVEDATA_FLASH1M) {
-			savedata->currentBank = &savedata->data[bank << 16];
+			savedata->currentBank = &savedata->data[bankOffset];
 		} else if (savedata->type == GBA_SAVEDATA_FLASH512) {
 			savedata->currentBank = savedata->data;
 		}

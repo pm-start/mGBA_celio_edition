@@ -12,6 +12,7 @@
 
 #include <QFile>
 #include <QLoggingCategory>
+#include <QMutex>
 #include <QObject>
 #include <QStringList>
 #include <QTextStream>
@@ -77,6 +78,7 @@ private:
 	bool m_debug = false;
 	int m_fileLevels = mLOG_WARN | mLOG_ERROR | mLOG_FATAL;
 	QString m_logPath;
+	QMutex m_fileLock;
 	std::unique_ptr<QFile> m_logFile;
 	std::unique_ptr<QTextStream> m_logStream;
 
