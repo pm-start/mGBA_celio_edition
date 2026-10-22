@@ -107,7 +107,9 @@ void SaveBackup::store(const QByteArray& data) {
 	}
 	out.close();
 	files.append(name);
-	while (files.size() > MAX_BACKUPS) {
+	// a big save (8MB or more) keeps fewer generations so the backup folder stays small
+	int limit = data.size() >= LARGE_SAVE_SIZE ? MAX_BACKUPS_LARGE : MAX_BACKUPS;
+	while (files.size() > limit) {
 		dir.remove(files.takeFirst());
 	}
 }
