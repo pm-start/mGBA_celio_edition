@@ -1405,10 +1405,21 @@ void CelioNet::handleEvent(const std::string& json, long ackId) {
 		if (ackId >= 0) {
 			sendText("43" + std::to_string(ackId) + "[true]");
 		}
-		long sequence = 0;
-		std::vector<uint16_t> data;
-		if (jsonNumber(json, "sequence", sequence) && jsonNumberArray(json, "data", data)) {
-			deliverData(sequence, std::move(data));
+		// Celio-Server since 2026-10-03 sends an array of packets ([{sequence,data},...]);
+		// older servers send one object. Both are read here: one {...} per packet (no nesting inside).
+		size_t objStart = json.find('{');
+		while (objStart != std::string::npos) {
+			size_t objEnd = json.find('}', objStart);
+			if (objEnd == std::string::npos) {
+				break;
+			}
+			std::string obj = json.substr(objStart, objEnd - objStart + 1);
+			long sequence = 0;
+			std::vector<uint16_t> data;
+			if (jsonNumber(obj, "sequence", sequence) && jsonNumberArray(obj, "data", data)) {
+				deliverData(sequence, std::move(data));
+			}
+			objStart = json.find('{', objEnd);
 		}
 	} else if (name == "deviceCommand") {
 		std::string uuid;
@@ -1535,14 +1546,17 @@ void CelioNet::workThread() {
 			if (item.isStatus) {
 				text = "42[\"deviceStatus\",{\"uuid\":\"" + makeUuid() + "\",\"linkStatus\":" + std::to_string(item.status) + "}]";
 			} else {
-				text = "42[\"deviceData\",{\"sequence\":" + std::to_string(m_outSequence) + ",\"data\":[";
+				// Celio-Server since 2026-10-03 only accepts an array of packets (isDataPacketBatch) and
+				// answers a single object with ack=false and drops it. MGBA_CELIO_NET_LEGACY=1 sends the old single object.
+				static const bool legacy = []() { const char* e = getenv("MGBA_CELIO_NET_LEGACY"); return e && *e && *e != '0'; }();
+				text = std::string("42[\"deviceData\",") + (legacy ? "" : "[") + "{\"sequence\":" + std::to_string(m_outSequence) + ",\"data\":[";
 				for (size_t i = 0; i < item.data.size(); ++i) {
 					if (i) {
 						text += ",";
 					}
 					text += std::to_string(item.data[i]);
 				}
-				text += "]}]";
+				text += legacy ? "]}]" : "]}]]";
 			}
 			lock.unlock();
 			bool ok = sendText(text);
