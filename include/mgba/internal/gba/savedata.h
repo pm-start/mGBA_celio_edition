@@ -86,12 +86,20 @@ struct GBASavedata {
 
 	enum FlashStateMachine flashState;
 
-	// Flash extension: banks 2 and up exist only after the game switches to them
+	// Flash extension: banks 2 and up exist only after the game writes to them.
+	// flashExtSize is the size held now: 6MB (banks 0-95) or 16MB (banks 0-255); it grows only when needed.
 	bool flashExt;
+	size_t flashExtSize;
+	// Bank the game switched to that is beyond the data held (reads see erased flash; -1 if none)
+	int pendingBank;
 };
 
-#define GBA_SIZE_FLASH_EXT 0x00600000
+// Largest flash extension: 16MB, 256 banks of 64KB (the bank number is one byte)
+#define GBA_SIZE_FLASH_EXT 0x01000000
 #define GBA_FLASH_EXT_BANKS (GBA_SIZE_FLASH_EXT >> 16)
+// The earlier 6MB extension (96 banks)
+#define GBA_SIZE_FLASH_EXT_6M 0x00600000
+#define GBA_FLASH_EXT_6M_BANKS (GBA_SIZE_FLASH_EXT_6M >> 16)
 // Size of saves written by the earlier 1MiB extension (16 banks)
 #define GBA_SIZE_FLASH_EXT_1M 0x00100000
 

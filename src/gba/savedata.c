@@ -35,8 +35,14 @@
 mLOG_DEFINE_CATEGORY(GBA_SAVE, "GBA Savedata", "gba.savedata");
 
 static void _flashSwitchBank(struct GBASavedata* savedata, int bank);
-static void _flashExtend(struct GBASavedata* savedata);
+static bool _flashExtend(struct GBASavedata* savedata, size_t target);
 static size_t _flashExtDataEnd(off_t end);
+static size_t _flashCapacity(const struct GBASavedata* savedata);
+static size_t _flashTierForSize(off_t end);
+static void _flashMaterialize(struct GBASavedata* savedata);
+
+// Reads of a bank beyond the data held see erased flash from here; the data grows on the first write
+static uint8_t _erasedBank[0x10000];
 static void _flashErase(struct GBASavedata* savedata);
 static void _flashEraseSector(struct GBASavedata* savedata, uint16_t sectorStart);
 
@@ -62,6 +68,8 @@ void GBASavedataInit(struct GBASavedata* savedata, struct VFile* vf) {
 	savedata->dirty = 0;
 	savedata->dirtAge = 0;
 	savedata->flashExt = false;
+	savedata->flashExtSize = 0;
+	savedata->pendingBank = -1;
 	savedata->dust.name = "GBA Savedata Settling";
 	savedata->dust.priority = 0x70;
 	savedata->dust.context = savedata;
@@ -108,6 +116,8 @@ void GBASavedataDeinit(struct GBASavedata* savedata) {
 	savedata->data = 0;
 	savedata->type = GBA_SAVEDATA_AUTODETECT;
 	savedata->flashExt = false;
+	savedata->flashExtSize = 0;
+	savedata->pendingBank = -1;
 }
 
 void GBASavedataMask(struct GBASavedata* savedata, struct VFile* vf, bool writeback) {
@@ -181,7 +191,7 @@ size_t GBASavedataSize(const struct GBASavedata* savedata) {
 	case GBA_SAVEDATA_FLASH512:
 		return GBA_SIZE_FLASH512;
 	case GBA_SAVEDATA_FLASH1M:
-		return savedata->flashExt ? GBA_SIZE_FLASH_EXT : GBA_SIZE_FLASH1M;
+		return _flashCapacity(savedata);
 	case GBA_SAVEDATA_EEPROM:
 		return GBA_SIZE_EEPROM;
 	case GBA_SAVEDATA_EEPROM512:
@@ -202,14 +212,21 @@ bool GBASavedataLoad(struct GBASavedata* savedata, struct VFile* in) {
 		if (!in || savedata->type == GBA_SAVEDATA_FORCE_NONE) {
 			return false;
 		}
-		if (savedata->type == GBA_SAVEDATA_FLASH1M && !savedata->flashExt && in->size(in) >= GBA_SIZE_FLASH_EXT_1M) {
-			_flashExtend(savedata);
+		if (savedata->type == GBA_SAVEDATA_FLASH1M) {
+			// Grow only as far as the save being loaded needs (a 128KiB save, with or without the RTC footer, stays as it is)
+			size_t tier = _flashTierForSize(in->size(in));
+			if (tier > (savedata->flashExt ? savedata->flashExtSize : 0)) {
+				_flashExtend(savedata, tier);
+			}
 		}
 		ssize_t size = GBASavedataSize(savedata);
 		in->seek(in, 0, SEEK_SET);
 		if (savedata->flashExt) {
 			// An older or smaller save fills the start; the rest stays erased
 			ssize_t dataEnd = _flashExtDataEnd(in->size(in));
+			if (dataEnd > size) {
+				dataEnd = size;
+			}
 			if (dataEnd < size) {
 				memset(&savedata->data[dataEnd], 0xFF, size - dataEnd);
 			}
@@ -295,16 +312,19 @@ void GBASavedataInitFlash(struct GBASavedata* savedata) {
 	}
 	off_t end;
 	savedata->flashExt = false;
+	savedata->flashExtSize = 0;
+	savedata->pendingBank = -1;
 	if (!savedata->vf) {
 		end = 0;
 		savedata->data = anonymousMemoryMap(GBA_SIZE_FLASH_EXT);
 		memset(&savedata->data[GBA_SIZE_FLASH1M], 0xFF, GBA_SIZE_FLASH_EXT - GBA_SIZE_FLASH1M);
 	} else {
 		end = savedata->vf->size(savedata->vf);
-		if (savedata->type == GBA_SAVEDATA_FLASH1M && end >= GBA_SIZE_FLASH_EXT) {
-			// A save that already holds the extension
+		if (savedata->type == GBA_SAVEDATA_FLASH1M && end >= GBA_SIZE_FLASH_EXT_6M) {
+			// A save that already holds the extension: 6MB stays 6MB, 16MB is 16MB
 			savedata->flashExt = true;
-			flashSize = GBA_SIZE_FLASH_EXT;
+			savedata->flashExtSize = end >= GBA_SIZE_FLASH_EXT ? GBA_SIZE_FLASH_EXT : GBA_SIZE_FLASH_EXT_6M;
+			flashSize = savedata->flashExtSize;
 		}
 		if (end < flashSize) {
 			savedata->vf->truncate(savedata->vf, flashSize);
@@ -321,7 +341,7 @@ void GBASavedataInitFlash(struct GBASavedata* savedata) {
 	}
 	if (savedata->type == GBA_SAVEDATA_FLASH1M && !savedata->flashExt && end >= GBA_SIZE_FLASH_EXT_1M) {
 		// A save of the earlier 1MiB extension
-		_flashExtend(savedata);
+		_flashExtend(savedata, GBA_SIZE_FLASH_EXT_6M);
 	}
 
 	mCALLBACKS_INVOKE(savedata->p, memoryBlocksChanged);
@@ -431,6 +451,12 @@ void GBASavedataWriteFlash(struct GBASavedata* savedata, uint16_t address, uint8
 	case FLASH_STATE_RAW:
 		switch (savedata->command) {
 		case FLASH_COMMAND_PROGRAM:
+			_flashMaterialize(savedata);
+			if (savedata->pendingBank >= 0) {
+				// The data could not grow: the write is lost
+				savedata->command = FLASH_COMMAND_NONE;
+				break;
+			}
 			savedata->dirty |= mSAVEDATA_DIRT_NEW;
 			savedata->currentBank[address] = value;
 			savedata->command = FLASH_COMMAND_NONE;
@@ -438,7 +464,7 @@ void GBASavedataWriteFlash(struct GBASavedata* savedata, uint16_t address, uint8
 			mTimingSchedule(&savedata->p->timing, &savedata->dust, FLASH_PROGRAM_CYCLES);
 			break;
 		case FLASH_COMMAND_SWITCH_BANK:
-			if (address == 0 && value < GBA_FLASH_EXT_BANKS) { // banks 2 and up: flash extension
+			if (address == 0) { // banks 2 and up: flash extension (the bank number is one byte: up to 256 banks)
 				_flashSwitchBank(savedata, value);
 			} else {
 				mLOG(GBA_SAVE, GAME_ERROR, "Bad flash bank switch");
@@ -649,9 +675,10 @@ void GBASavedataRTCWrite(struct GBASavedata* savedata) {
 	savedata->vf->seek(savedata->vf, size & ~0xFF, SEEK_SET);
 
 	size_t bankOffset = 0;
+	bool virtualBank = savedata->pendingBank >= 0;
 	if ((savedata->vf->size(savedata->vf) & 0xFF) != sizeof(buffer)) {
 		// Writing past the end of the file can invalidate the file mapping
-		if (savedata->type == GBA_SAVEDATA_FLASH1M && savedata->currentBank) {
+		if (savedata->type == GBA_SAVEDATA_FLASH1M && savedata->currentBank && !virtualBank) {
 			bankOffset = savedata->currentBank - savedata->data;
 		}
 		savedata->vf->unmap(savedata->vf, savedata->data, size);
@@ -661,7 +688,9 @@ void GBASavedataRTCWrite(struct GBASavedata* savedata) {
 	if (!savedata->data) {
 		savedata->data = savedata->vf->map(savedata->vf, size, MAP_WRITE);
 		if (savedata->type == GBA_SAVEDATA_FLASH1M) {
-			savedata->currentBank = &savedata->data[bankOffset];
+			if (!virtualBank) {
+				savedata->currentBank = &savedata->data[bankOffset];
+			}
 		} else if (savedata->type == GBA_SAVEDATA_FLASH512) {
 			savedata->currentBank = savedata->data;
 		}
@@ -761,7 +790,9 @@ void GBASavedataSerialize(const struct GBASavedata* savedata, struct GBASerializ
 	STORE_32(savedata->writeAddress, 0, &state->savedata.writeAddress);
 	STORE_16(savedata->settling, 0, &state->savedata.settlingSector);
 	uint16_t bank = 0;
-	if (savedata->data && savedata->currentBank) {
+	if (savedata->pendingBank >= 0) {
+		bank = savedata->pendingBank;
+	} else if (savedata->data && savedata->currentBank) {
 		bank = (savedata->currentBank - savedata->data) >> 16;
 	}
 	STORE_16(bank >= 2 ? bank : 0, 0, &state->savedata.reserved);
@@ -813,13 +844,34 @@ static void _flashSwitchBank(struct GBASavedata* savedata, int bank) {
 	if (bank >= GBA_FLASH_EXT_BANKS) {
 		bank &= 1;
 	}
-	if (bank >= 2 && savedata->type == GBA_SAVEDATA_FLASH1M && !savedata->flashExt) {
-		_flashExtend(savedata);
+	if (bank >= 2 && savedata->type == GBA_SAVEDATA_FLASH1M && ((size_t) bank << 16) >= _flashCapacity(savedata)) {
+		// Beyond the data held: reads see erased flash, and the save grows on the first write
+		memset(_erasedBank, 0xFF, sizeof(_erasedBank));
+		savedata->pendingBank = bank;
+		savedata->currentBank = _erasedBank;
+		return;
 	}
-	if (bank >= 2 && !savedata->flashExt) {
+	if (bank >= 2 && savedata->type != GBA_SAVEDATA_FLASH1M) {
 		bank &= 1;
 	}
-	savedata->currentBank = &savedata->data[bank << 16];
+	savedata->pendingBank = -1;
+	savedata->currentBank = &savedata->data[(size_t) bank << 16];
+}
+
+// Size of the flash data held now
+static size_t _flashCapacity(const struct GBASavedata* savedata) {
+	return savedata->flashExt ? savedata->flashExtSize : GBA_SIZE_FLASH1M;
+}
+
+// Extension size a save file of the given size holds (0: none; a 1MiB file is brought up to 6MB)
+static size_t _flashTierForSize(off_t end) {
+	if (end >= GBA_SIZE_FLASH_EXT) {
+		return GBA_SIZE_FLASH_EXT;
+	}
+	if (end >= GBA_SIZE_FLASH_EXT_1M) {
+		return GBA_SIZE_FLASH_EXT_6M;
+	}
+	return 0;
 }
 
 // End of the flash data held in a save file of the given size (the RTC footer may follow it)
@@ -827,47 +879,95 @@ static size_t _flashExtDataEnd(off_t end) {
 	if (end >= GBA_SIZE_FLASH_EXT) {
 		return GBA_SIZE_FLASH_EXT;
 	}
+	if (end >= GBA_SIZE_FLASH_EXT_6M) {
+		return GBA_SIZE_FLASH_EXT_6M;
+	}
 	if (end >= GBA_SIZE_FLASH_EXT_1M) {
 		return GBA_SIZE_FLASH_EXT_1M;
 	}
 	return end >= GBA_SIZE_FLASH1M ? GBA_SIZE_FLASH1M : (size_t) end;
 }
 
-// Flash extension: grow the 128KB flash to 6MB (96 banks of 64KB).
-// Real carts only have banks 0 and 1, so a game only uses banks 2 and up on this build of mGBA.
-static void _flashExtend(struct GBASavedata* savedata) {
-	if (savedata->flashExt || savedata->type != GBA_SAVEDATA_FLASH1M) {
+// The game writes to a bank beyond the data held: grow the save to hold it
+static void _flashMaterialize(struct GBASavedata* savedata) {
+	if (savedata->pendingBank < 0) {
 		return;
 	}
-	mLOG(GBA_SAVE, INFO, "Extending flash to 6MB");
-	size_t bankOffset = savedata->currentBank - savedata->data;
+	_flashExtend(savedata, savedata->pendingBank < GBA_FLASH_EXT_6M_BANKS ? GBA_SIZE_FLASH_EXT_6M : GBA_SIZE_FLASH_EXT);
+}
+
+// Flash extension: grow the flash to the target size (6MB = 96 banks, or 16MB = 256 banks of 64KB).
+// Real carts only have banks 0 and 1, so a game only uses banks 2 and up on this build of mGBA.
+// The existing data is never rewritten: the new part is appended as erased flash first and the RTC footer
+// is moved last, so a stop in the middle still leaves the old save readable.
+static bool _flashExtend(struct GBASavedata* savedata, size_t target) {
+	if (savedata->type != GBA_SAVEDATA_FLASH1M) {
+		return false;
+	}
+	size_t current = savedata->flashExt ? savedata->flashExtSize : 0;
+	if (target <= current) {
+		return true;
+	}
+	mLOG(GBA_SAVE, INFO, "Extending flash to %uMB", (unsigned) (target >> 20));
+	size_t oldSize = _flashCapacity(savedata);
+	size_t bankOffset = (savedata->pendingBank < 0 && savedata->currentBank) ? savedata->currentBank - savedata->data : 0;
 	if (savedata->vf) {
 		off_t end = savedata->vf->size(savedata->vf);
 		size_t dataEnd = _flashExtDataEnd(end);
 		uint8_t footer[sizeof(struct GBASavedataRTCBuffer)];
+		uint8_t erased[4096];
+		memset(erased, 0xFF, sizeof(erased));
 		bool hasFooter = false;
-		savedata->vf->unmap(savedata->vf, savedata->data, GBA_SIZE_FLASH1M);
-		if (end < GBA_SIZE_FLASH_EXT) {
-			// The RTC footer sits right after the flash data: move it after the 6MB
-			if (end >= (off_t) (dataEnd + sizeof(footer))) {
+		bool ok = true;
+		savedata->vf->unmap(savedata->vf, savedata->data, oldSize);
+		if (end < (off_t) target) {
+			if ((size_t) end == dataEnd + sizeof(footer)) {
+				// The RTC footer sits right after the flash data
 				savedata->vf->seek(savedata->vf, dataEnd, SEEK_SET);
 				hasFooter = savedata->vf->read(savedata->vf, footer, sizeof(footer)) == sizeof(footer);
 			}
-			savedata->vf->truncate(savedata->vf, GBA_SIZE_FLASH_EXT);
-			if (hasFooter) {
-				savedata->vf->seek(savedata->vf, GBA_SIZE_FLASH_EXT, SEEK_SET);
-				savedata->vf->write(savedata->vf, footer, sizeof(footer));
+			// 1. Append erased flash up to the new size (the old footer stays where it is)
+			savedata->vf->seek(savedata->vf, end, SEEK_SET);
+			for (off_t pos = end; ok && pos < (off_t) target;) {
+				size_t chunk = target - pos < sizeof(erased) ? target - pos : sizeof(erased);
+				ok = savedata->vf->write(savedata->vf, erased, chunk) == (ssize_t) chunk;
+				pos += chunk;
+			}
+			// 2. The footer goes after the new end
+			if (ok && hasFooter) {
+				ok = savedata->vf->write(savedata->vf, footer, sizeof(footer)) == (ssize_t) sizeof(footer);
+			}
+			// 3. The old footer position becomes erased flash
+			if (ok && (size_t) end > dataEnd) {
+				savedata->vf->seek(savedata->vf, dataEnd, SEEK_SET);
+				ok = savedata->vf->write(savedata->vf, erased, end - dataEnd) == end - (off_t) dataEnd;
 			}
 		}
-		savedata->data = savedata->vf->map(savedata->vf, GBA_SIZE_FLASH_EXT, savedata->mapMode);
-		if (end < GBA_SIZE_FLASH_EXT) {
-			memset(&savedata->data[dataEnd], 0xFF, GBA_SIZE_FLASH_EXT - dataEnd);
+		if (ok) {
+			savedata->data = savedata->vf->map(savedata->vf, target, savedata->mapMode);
+			ok = savedata->data != NULL;
+		}
+		if (!ok) {
+			mLOG(GBA_SAVE, WARN, "Could not extend flash");
+			savedata->data = savedata->vf->map(savedata->vf, oldSize, savedata->mapMode);
+			if (savedata->pendingBank < 0 && savedata->data) {
+				savedata->currentBank = &savedata->data[bankOffset];
+			}
+			return false;
 		}
 	}
-	savedata->currentBank = &savedata->data[bankOffset];
 	savedata->flashExt = true;
+	savedata->flashExtSize = target;
+	if (savedata->pendingBank >= 0 && ((size_t) savedata->pendingBank << 16) < target) {
+		bankOffset = (size_t) savedata->pendingBank << 16;
+		savedata->pendingBank = -1;
+	}
+	if (savedata->pendingBank < 0) {
+		savedata->currentBank = &savedata->data[bankOffset];
+	}
 	savedata->dirty |= mSAVEDATA_DIRT_NEW;
 	mCALLBACKS_INVOKE(savedata->p, memoryBlocksChanged);
+	return true;
 }
 
 void _flashErase(struct GBASavedata* savedata) {
@@ -875,7 +975,7 @@ void _flashErase(struct GBASavedata* savedata) {
 	savedata->dirty |= mSAVEDATA_DIRT_NEW;
 	size_t size = GBA_SIZE_FLASH512;
 	if (savedata->type == GBA_SAVEDATA_FLASH1M) {
-		size = savedata->flashExt ? GBA_SIZE_FLASH_EXT : GBA_SIZE_FLASH1M;
+		size = _flashCapacity(savedata);
 	}
 	memset(savedata->data, 0xFF, size);
 }
@@ -890,5 +990,8 @@ void _flashEraseSector(struct GBASavedata* savedata, uint16_t sectorStart) {
 	savedata->settling = sectorStart >> 12;
 	mTimingDeschedule(&savedata->p->timing, &savedata->dust);
 	mTimingSchedule(&savedata->p->timing, &savedata->dust, FLASH_ERASE_CYCLES);
-	memset(&savedata->currentBank[sectorStart & ~(size - 1)], 0xFF, size);
+	if (savedata->pendingBank < 0) {
+		// A bank beyond the data held is already erased
+		memset(&savedata->currentBank[sectorStart & ~(size - 1)], 0xFF, size);
+	}
 }
