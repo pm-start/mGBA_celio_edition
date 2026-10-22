@@ -13,6 +13,8 @@ frame sources reside in immutable ROM. Native BG VRAM/tilemaps are not inputs.
 
 Control (32 bytes): magic `0x34584748`, controlBytes=32, sceneBytes=64,
 cellBytes=16, scenePtr, capabilities, animationLookupPtr, animationLookupCount.
+The optional [OBJ256 extension](obj256-abi.md) expands the control to 40 bytes;
+the field renderer accepts both control sizes.
 
 Scene (64 bytes): serial, enabledBgMask, cellsPtr, columns=16, rows=12,
 signed originScreenX, signed originScreenY, animationTick, dnsCoefficient,
@@ -80,3 +82,33 @@ reset or state restore.
 
 `mgba-hgx-test` exercises the actual software compositor with synthetic ROM
 resources; it does not require a commercial ROM or modify a save file.
+
+## Optional 256-color map chips, version one
+
+A tileset opts in by setting its native padding bytes +2 to `0xA8` and +3 to
+`1`. All other native fields retain their offsets. A marked descriptor has an
+additional +24 legacyPaletteROMPtr, making it 28 bytes. Unmarked tilesets retain
+the original 24-byte layout and four-bit behavior.
+
+The marked tileset's +4 source contains uncompressed 64-byte 8bpp tiles; its
++8 palette contains exactly 256 BGR555 colors, 512 bytes. Both sources reside in
+ROM. Compression byte +0 must be zero in this version. Tile numbers still split
+at 640, secondary tile numbers subtract 640, and H/V flip bits retain their
+native meanings. The reference palette nibble is ignored: each tile uses the
+palette of its own primary/secondary tile role. DNS eligibility uses role bank
+zero for primary, seven for secondary. Alpha depends on the pixel index: zero
+is transparent; every other index is opaque, including RGB black.
+
+Native four-bit tiles, marked eight-bit tiles and private OBJ256 palettes may
+coexist in the same frame. Shared palette snapshots avoid replicating 256
+colors in every tile command. Legacy four-bit tile/palette animation recipes
+are not applied to marked materials; version one displays their static base
+frame. Eight-bit animation/compressed sources need a future explicit recipe.
+
+The optional legacy palette pointer retains the original complete 256-entry
+native banked palette. A native four-bit tile whose palette owner is marked
+uses this legacy array. Explicit 32-byte door frames also remain four-bit and
+select their original bank from this array. An unavailable legacy door palette,
+unsupported marked codec/version, or invalid overlay resource rejects the
+entire overlay before replacing any base-cell command. No native VRAM fallback
+or reinterpretation of 32-byte frame recipes as 64-byte tiles is introduced.

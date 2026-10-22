@@ -151,6 +151,10 @@
 	}
 
 int GBAVideoSoftwareRendererPreprocessSprite(struct GBAVideoSoftwareRenderer* renderer, struct GBAObj* sprite, int index, int y) {
+	const uint8_t* customPixels = NULL;
+	const mColor* customColors = NULL;
+	bool custom256 = GBAVideoSoftwareRendererGetOBJ256(renderer, sprite, index, &customPixels, &customColors);
+	bool is256 = custom256 || GBAObjAttributesAIs256Color(sprite->a);
 	int width = GBAVideoObjSizes[GBAObjAttributesAGetShape(sprite->a) * 4 + GBAObjAttributesBGetSize(sprite->b)][0];
 	int height = GBAVideoObjSizes[GBAObjAttributesAGetShape(sprite->a) * 4 + GBAObjAttributesBGetSize(sprite->b)][1];
 	int start = renderer->start;
@@ -165,11 +169,15 @@ int GBAVideoSoftwareRendererPreprocessSprite(struct GBAVideoSoftwareRenderer* re
 	x >>= 23;
 	x += renderer->objOffsetX;
 	uint16_t* vramBase = &renderer->d.vram[BASE_TILE >> 1];
-	unsigned align = GBAObjAttributesAIs256Color(sprite->a) && !GBARegisterDISPCNTIsObjCharacterMapping(renderer->dispcnt);
+	unsigned align = is256 && !GBARegisterDISPCNTIsObjCharacterMapping(renderer->dispcnt);
 	unsigned charBase = (GBAObjAttributesCGetTile(sprite->c) & ~align) * 0x20;
 	unsigned maskLo = GBARegisterDISPCNTIsObjCharacterMapping(renderer->dispcnt) ? 0x7FFE : 0x3FE;
 	unsigned maskHi = GBARegisterDISPCNTIsObjCharacterMapping(renderer->dispcnt) ? 0 : charBase & 0x7C00;
-	if (GBARegisterDISPCNTGetMode(renderer->dispcnt) >= 3 && GBAObjAttributesCGetTile(sprite->c) < 512) {
+	if (custom256) {
+		vramBase = (uint16_t*) customPixels;
+		charBase = 0; maskLo = 0x7FFE; maskHi = 0;
+	}
+	if (!custom256 && GBARegisterDISPCNTGetMode(renderer->dispcnt) >= 3 && GBAObjAttributesCGetTile(sprite->c) < 512) {
 		return 0;
 	}
 
@@ -208,8 +216,24 @@ int GBAVideoSoftwareRendererPreprocessSprite(struct GBAVideoSoftwareRenderer* re
 		}
 	}
 
+	mColor customNormal[256], customVariant[256];
+	if (custom256) {
+		for (unsigned color = 0; color < 256; ++color) {
+			mColor normal = customColors[color];
+			mColor changed = normal;
+			if (variant) { changed = renderer->blendEffect == BLEND_BRIGHTEN ? _brighten(normal, renderer->bldy) : _darken(normal, renderer->bldy); }
+			if (renderer->d.highlightAmount && renderer->d.highlightOBJ[index]) {
+				unsigned amount = renderer->d.highlightAmount >> 4;
+				normal = mColorMix5Bit(16 - amount, normal, amount, renderer->d.highlightColor);
+				changed = mColorMix5Bit(16 - amount, changed, amount, renderer->d.highlightColor);
+			}
+			customNormal[color] = normal; customVariant[color] = changed;
+		}
+		palette = variant ? customVariant : customNormal;
+		objwinPalette = variant && GBAWindowControlIsBlendEnable(renderer->objwin.packed) ? customVariant : customNormal;
+	}
 	int inY = y - ((int) GBAObjAttributesAGetY(sprite->a) + renderer->objOffsetY);
-	int stride = GBARegisterDISPCNTIsObjCharacterMapping(renderer->dispcnt) ? (width >> !GBAObjAttributesAIs256Color(sprite->a)) : 0x80;
+	int stride = custom256 ? width : (GBARegisterDISPCNTIsObjCharacterMapping(renderer->dispcnt) ? (width >> !is256) : 0x80);
 
 	uint32_t current;
 	if (GBAObjAttributesAIsTransformed(sprite->a)) {
@@ -282,7 +306,7 @@ int GBAVideoSoftwareRendererPreprocessSprite(struct GBAVideoSoftwareRenderer* re
 			return 0;
 		}
 
-		if (!GBAObjAttributesAIs256Color(sprite->a)) {
+		if (!is256) {
 			palette = &palette[GBAObjAttributesCGetPalette(sprite->c) << 4];
 			if (flags & FLAG_OBJWIN) {
 				SPRITE_TRANSFORMED_LOOP(16, OBJWIN);
@@ -339,7 +363,7 @@ int GBAVideoSoftwareRendererPreprocessSprite(struct GBAVideoSoftwareRenderer* re
 			inX = width - inX - 1;
 			xOffset = -1;
 		}
-		if (!GBAObjAttributesAIs256Color(sprite->a)) {
+		if (!is256) {
 			palette = &palette[GBAObjAttributesCGetPalette(sprite->c) << 4];
 			if (flags & FLAG_OBJWIN) {
 				SPRITE_NORMAL_LOOP(16, OBJWIN);

@@ -14,12 +14,18 @@
 #define H4_CELLS (H4_COLUMNS * H4_ROWS)
 #define H4_OVERLAYS 64
 #define H4_RESOURCES 32
+#define H4_PALETTES 4096
 
 struct H4Tile {
 	const uint8_t* pixels;
-	const uint8_t* palette;
+	const uint16_t* palette;
 	uint16_t ref;
-	uint16_t colors[16];
+	uint8_t depth, paletteBank;
+};
+struct H4Palette {
+	uint32_t source, callback;
+	unsigned role, firstColor, count;
+	uint16_t colors[256];
 };
 struct H4Resource { uint32_t source; uint8_t* data; size_t size; };
 struct H4MaterialCache { uint32_t layout; uint16_t ref; struct H4Tile tile; };
@@ -33,6 +39,8 @@ struct GBAVideoHGX4 {
 	struct H4Resource resources[H4_RESOURCES];
 	unsigned resourceCount;
 	struct H4MaterialCache material[4096];
+	struct H4Palette palettes[H4_PALETTES];
+	unsigned paletteCount;
 };
 
 static const uint8_t* _h4Read(struct GBA* gba, uint32_t address, size_t size) {
@@ -150,27 +158,84 @@ static const uint8_t* _h4Animated(struct GBAVideoSoftwareRenderer* renderer,
 	return result;
 }
 
+static bool _h4Is8(const uint8_t* set) { return set[2] == 0xA8 && set[3] == 1; }
+
+/* Palette snapshots are shared by material commands instead of embedding
+ * 256 colors in every tile and every material-cache entry. */
+static const uint16_t* _h4Palette(struct GBAVideoSoftwareRenderer* renderer, uint32_t source,
+                                const uint8_t* set, unsigned role, unsigned firstColor, unsigned count,
+                                bool animate) {
+	struct GBAVideoHGX4* state = renderer->hgx4;
+	uint32_t callback = animate ? _h4Word(set, 16) : 0;
+	for (unsigned n = 0; n < state->paletteCount; ++n) {
+		const struct H4Palette* cached = &state->palettes[n];
+		if (cached->source == source && cached->callback == callback && cached->role == role
+		    && cached->firstColor == firstColor && cached->count == count) { return cached->colors; }
+	}
+	const uint8_t* raw = _h4Read(renderer->d.p, source, count * 2);
+	if (!raw || state->paletteCount == H4_PALETTES) { return NULL; }
+	struct H4Palette* cached = &state->palettes[state->paletteCount++];
+	cached->source = source; cached->callback = callback; cached->role = role;
+	cached->firstColor = firstColor; cached->count = count;
+	for (unsigned color = 0; color < count; ++color) {
+		const uint8_t* animated = animate ? _h4Animated(renderer, set, role, firstColor + color, true) : NULL;
+		cached->colors[color] = animated ? _h4Half(animated, 0) : _h4Half(raw, color * 2);
+	}
+	return cached->colors;
+}
+
+static const uint16_t* _h4LegacyPalette(struct GBAVideoSoftwareRenderer* renderer,
+                                      const uint8_t* layout, uint16_t ref) {
+	unsigned bank = ref >> 12, role = bank >= 7;
+	uint32_t address = _h4Word(layout, 16 + role * 4);
+	const uint8_t* set = _h4Read(renderer->d.p, address, 24);
+	if (!set) { return NULL; }
+	if (set[2] == 0xA8 && !_h4Is8(set)) { return NULL; }
+	uint32_t source = _h4Word(set, 8);
+	if (_h4Is8(set)) {
+		set = _h4Read(renderer->d.p, address, 28);
+		if (!set) { return NULL; }
+		source = _h4Word(set, 24);
+		/* A marked set retains the original complete native palette specifically
+		 * for native4 materials and explicit 32-byte door frame sources. */
+		if (source < 0x08000000 || source >= 0x0C000000 || !_h4Read(renderer->d.p, source, 512)) { return NULL; }
+	}
+	return _h4Palette(renderer, source + bank * 32, set, role, bank * 16, 16, !_h4Is8(set));
+}
+
 static struct H4Tile _h4MaterialUncached(struct GBAVideoSoftwareRenderer* renderer, uint32_t layoutAddress, uint16_t ref) {
-	struct H4Tile result = { .ref = ref };
+	struct H4Tile result = { .ref = ref, .depth = 4, .paletteBank = ref >> 12 };
 	const uint8_t* layout = _h4Read(renderer->d.p, layoutAddress, 24);
 	if (!layout) { return result; }
-	unsigned index = ref & 1023, role = index >= 640, bank = ref >> 12;
+	unsigned index = ref & 1023, role = index >= 640;
 	const uint8_t* set = _h4Read(renderer->d.p, _h4Word(layout, 16 + role * 4), 24);
-	const uint8_t* palset = _h4Read(renderer->d.p, _h4Word(layout, 16 + (bank >= 7) * 4), 24);
-	if (!set || !palset) { return result; }
+	if (!set) { return result; }
 	index -= role * 640;
-	result.pixels = _h4Animated(renderer, set, role, index, false);
-	if (!result.pixels) {
-		uint32_t source = _h4Word(set, 4);
-		result.pixels = set[0] ? _h4Lz(renderer, source, index) : _h4Read(renderer->d.p, source + index * 32, 32);
+	uint32_t source = _h4Word(set, 4);
+	if (_h4Is8(set)) {
+		/* Version one is raw8 only. Legacy 32-byte animation recipes cannot be
+		 * reinterpreted as 64-byte tiles; marked materials use their base frame. */
+		if (set[0] || source < 0x08000000 || source >= 0x0C000000) { return result; }
+		result.depth = 8; result.paletteBank = role ? 7 : 0;
+		result.pixels = _h4Read(renderer->d.p, source + index * 64, 64);
+		uint32_t palette = _h4Word(set, 8);
+		if (palette >= 0x08000000 && palette < 0x0C000000) { result.palette = _h4Palette(renderer, palette, set, role, 0, 256, false); }
+	} else {
+		if (set[2] == 0xA8) { return result; } /* Unknown marked version. */
+		result.pixels = _h4Animated(renderer, set, role, index, false);
+		if (!result.pixels) { result.pixels = set[0] ? _h4Lz(renderer, source, index) : _h4Read(renderer->d.p, source + index * 32, 32); }
+		result.palette = _h4LegacyPalette(renderer, layout, ref);
 	}
-	result.palette = _h4Read(renderer->d.p, _h4Word(palset, 8) + bank * 32, 32);
-	if (result.palette) {
-		for (unsigned color = 0; color < 16; ++color) {
-			const uint8_t* animated = _h4Animated(renderer, palset, bank >= 7, bank * 16 + color, true);
-			result.colors[color] = animated ? _h4Half(animated, 0) : _h4Half(result.palette, color * 2);
-		}
-	}
+	return result;
+}
+
+static struct H4Tile _h4DoorTile(struct GBAVideoSoftwareRenderer* renderer, uint32_t layoutAddress,
+                               uint16_t ref, uint32_t source) {
+	struct H4Tile result = { .ref = ref, .depth = 4, .paletteBank = ref >> 12 };
+	const uint8_t* layout = _h4Read(renderer->d.p, layoutAddress, 24);
+	if (!layout || source < 0x08000000 || source >= 0x0C000000) { return result; }
+	result.pixels = _h4Read(renderer->d.p, source + ((ref & 1023) - 1016) * 32, 32);
+	result.palette = _h4LegacyPalette(renderer, layout, ref);
 	return result;
 }
 
@@ -191,28 +256,31 @@ static struct H4Tile _h4Material(struct GBAVideoSoftwareRenderer* renderer, uint
 
 static bool _h4Visible(const struct H4Tile* tile) {
 	if (!tile->pixels) { return false; }
-	for (unsigned n = 0; n < 32; ++n) { if (tile->pixels[n]) { return true; } }
+	for (unsigned n = 0; n < (tile->depth == 8 ? 64U : 32U); ++n) { if (tile->pixels[n]) { return true; } }
 	return false;
 }
 
-static void _h4Cell(struct GBAVideoSoftwareRenderer* renderer, unsigned cell,
-                    uint32_t layout, const uint8_t* refs, unsigned layer, uint32_t sourceTiles) {
+static bool _h4Cell(struct GBAVideoSoftwareRenderer* renderer, unsigned cell,
+                    uint32_t layout, const uint8_t* refs, unsigned layer, uint32_t sourceTiles, bool overlay) {
 	struct GBAVideoHGX4* state = renderer->hgx4;
+	struct H4Tile layers[3][4] = { 0 };
 	for (unsigned q = 0; q < 4; ++q) {
-		struct H4Tile lower = _h4Material(renderer, layout, _h4Half(refs, q * 2));
-		struct H4Tile upper = _h4Material(renderer, layout, _h4Half(refs, (q + 4) * 2));
-		if (sourceTiles) {
-			unsigned index = lower.ref & 1023;
-			if (index >= 1016) { lower.pixels = _h4Read(renderer->d.p, sourceTiles + (index - 1016) * 32, 32); }
-			index = upper.ref & 1023;
-			if (index >= 1016) { upper.pixels = _h4Read(renderer->d.p, sourceTiles + (index - 1016) * 32, 32); }
+		struct H4Tile entries[2] = { 0 };
+		for (unsigned half = 0; half < 2; ++half) {
+			if (layer & (0x100U << half)) { continue; }
+			uint16_t ref = _h4Half(refs, (q + half * 4) * 2);
+			bool door = sourceTiles && (ref & 1023) >= 1016;
+			entries[half] = door ? _h4DoorTile(renderer, layout, ref, sourceTiles) : _h4Material(renderer, layout, ref);
+			/* Invalid or unavailable legacy door palettes reject the whole overlay
+			 * before any base-cell command is replaced. */
+			if ((door || overlay) && (!entries[half].pixels || !entries[half].palette)) { return false; }
 		}
-		if (layer & 0x100) { memset(&lower, 0, sizeof(lower)); }
-		if (layer & 0x200) { memset(&upper, 0, sizeof(upper)); }
-		if ((layer & 3) == 0) { state->tiles[1][cell][q] = lower; state->tiles[0][cell][q] = upper; }
-		else if ((layer & 3) == 1) { state->tiles[2][cell][q] = lower; state->tiles[1][cell][q] = upper; }
-		else if ((layer & 3) == 2) { state->tiles[2][cell][q] = lower; state->tiles[0][cell][q] = upper; }
+		if ((layer & 3) == 0) { layers[1][q] = entries[0]; layers[0][q] = entries[1]; }
+		else if ((layer & 3) == 1) { layers[2][q] = entries[0]; layers[1][q] = entries[1]; }
+		else if ((layer & 3) == 2) { layers[2][q] = entries[0]; layers[0][q] = entries[1]; }
 	}
+	for (unsigned bg = 0; bg < 3; ++bg) { memcpy(state->tiles[bg][cell], layers[bg], sizeof(layers[bg])); }
+	return true;
 }
 
 static void _h4Padding(struct GBAVideoSoftwareRenderer* renderer, unsigned cell, const uint8_t* baseRefs) {
@@ -248,7 +316,7 @@ void GBAVideoSoftwareRendererLatchHGX4(struct GBAVideoSoftwareRenderer* renderer
 	uint32_t address = _h4Word(rom, 0xB8);
 	if (address == 0x040003E0) { address = gba->memory.io[0x1F0] | ((uint32_t) gba->memory.io[0x1F1] << 16); }
 	const uint8_t* control = _h4Read(gba, address, 32);
-	if (!control || _h4Word(control, 0) != 0x34584748 || _h4Word(control, 4) != 32
+	if (!control || _h4Word(control, 0) != 0x34584748 || (_h4Word(control, 4) != 32 && _h4Word(control, 4) != 40)
 	    || _h4Word(control, 8) != 64 || _h4Word(control, 12) != 16) { return; }
 	const uint8_t* scene = _h4Read(gba, _h4Word(control, 16), 64);
 	if (!scene || _h4Word(scene, 12) != H4_COLUMNS || _h4Word(scene, 16) != H4_ROWS) { return; }
@@ -273,6 +341,7 @@ void GBAVideoSoftwareRendererLatchHGX4(struct GBAVideoSoftwareRenderer* renderer
 	}
 	memset(state->tiles, 0, sizeof(state->tiles));
 	memset(state->material, 0, sizeof(state->material));
+	state->paletteCount = 0;
 	for (unsigned c = 0; c < H4_CELLS; ++c) {
 		const uint8_t* layout = _h4Read(gba, state->cells[c][0], 24);
 		if (!layout) { continue; }
@@ -283,7 +352,7 @@ void GBAVideoSoftwareRendererLatchHGX4(struct GBAVideoSoftwareRenderer* renderer
 		const uint8_t* refs = _h4Read(gba, _h4Word(set, 12) + id * 16, 16);
 		const uint8_t* attrs = _h4Read(gba, _h4Word(set, 20) + id * 4, 4);
 		if (!refs || !attrs) { continue; }
-		_h4Cell(renderer, c, state->cells[c][0], refs, (_h4Word(attrs, 0) >> 29) & 3, 0);
+		_h4Cell(renderer, c, state->cells[c][0], refs, (_h4Word(attrs, 0) >> 29) & 3, 0, false);
 		_h4Padding(renderer, c, refs);
 	}
 	for (unsigned n = 0; n < overlays; ++n) {
@@ -291,8 +360,7 @@ void GBAVideoSoftwareRendererLatchHGX4(struct GBAVideoSoftwareRenderer* renderer
 		unsigned col = _h4Word(overlay, 0), row = _h4Word(overlay, 4);
 		if (col >= H4_COLUMNS || row >= H4_ROWS) { continue; }
 		unsigned c = row * H4_COLUMNS + col;
-		for (unsigned bg = 0; bg < 3; ++bg) { memset(state->tiles[bg][c], 0, sizeof(state->tiles[bg][c])); }
-		_h4Cell(renderer, c, _h4Word(overlay, 8), overlay + 16, _h4Word(overlay, 12), _h4Word(overlay, 32));
+		_h4Cell(renderer, c, _h4Word(overlay, 8), overlay + 16, _h4Word(overlay, 12), _h4Word(overlay, 32), true);
 	}
 	state->valid = true;
 }
@@ -327,10 +395,10 @@ bool GBAVideoSoftwareRendererDrawHGX4(struct GBAVideoSoftwareRenderer* renderer,
 		if (!tile->pixels || !tile->palette) { continue; }
 		unsigned tx = sx & 7, ty = sy & 7;
 		if (tile->ref & 0x400) { tx ^= 7; } if (tile->ref & 0x800) { ty ^= 7; }
-		unsigned pixel = (tile->pixels[ty * 4 + tx / 2] >> ((tx & 1) * 4)) & 15;
+		unsigned pixel = tile->depth == 8 ? tile->pixels[ty * 8 + tx] : (tile->pixels[ty * 4 + tx / 2] >> ((tx & 1) * 4)) & 15;
 		if (!pixel) { continue; }
-		uint16_t raw = tile->colors[pixel];
-		if ((raw & 0x7FFF) && (state->scene[10] & (1U << (tile->ref >> 12)))) { raw = _h4Tint(raw, state->scene[9], state->scene[8]); }
+		uint16_t raw = tile->palette[pixel];
+		if ((raw & 0x7FFF) && (state->scene[10] & (1U << tile->paletteBank))) { raw = _h4Tint(raw, state->scene[9], state->scene[8]); }
 		raw = _h4Tint(raw, state->scene[14], state->scene[15]);
 		unsigned color = mColorFrom555(raw);
 		bool variant = renderer->blendEffect == BLEND_BRIGHTEN || renderer->blendEffect == BLEND_DARKEN;

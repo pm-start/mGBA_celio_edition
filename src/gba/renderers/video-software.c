@@ -90,6 +90,7 @@ void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer) {
 
 	renderer->temporaryBuffer = NULL;
 	renderer->hgx4 = NULL;
+	renderer->obj256 = NULL;
 }
 
 static void GBAVideoSoftwareRendererInit(struct GBAVideoRenderer* renderer) {
@@ -110,6 +111,7 @@ static void GBAVideoSoftwareRendererInit(struct GBAVideoRenderer* renderer) {
 static void GBAVideoSoftwareRendererReset(struct GBAVideoRenderer* renderer) {
 	struct GBAVideoSoftwareRenderer* hgx = (struct GBAVideoSoftwareRenderer*) renderer;
 	GBAVideoSoftwareRendererResetHGX4(hgx);
+	GBAVideoSoftwareRendererResetOBJ256(hgx);
 	for (unsigned n = 0; n < 64; ++n) {
 		free(hgx->hgxDecoded[n]);
 		hgx->hgxDecoded[n] = NULL;
@@ -182,6 +184,7 @@ static void GBAVideoSoftwareRendererReset(struct GBAVideoRenderer* renderer) {
 static void GBAVideoSoftwareRendererDeinit(struct GBAVideoRenderer* renderer) {
 	struct GBAVideoSoftwareRenderer* hgx = (struct GBAVideoSoftwareRenderer*) renderer;
 	GBAVideoSoftwareRendererResetHGX4(hgx);
+	GBAVideoSoftwareRendererResetOBJ256(hgx);
 	free(hgx->hgxPreviousFrame);
 	hgx->hgxPreviousFrame = NULL;
 	hgx->hgxPreviousValid = false;
@@ -654,6 +657,7 @@ static bool _hgxHoldTransaction(struct GBAVideoSoftwareRenderer* renderer, int y
 static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* renderer, int y) {
 	struct GBAVideoSoftwareRenderer* softwareRenderer = (struct GBAVideoSoftwareRenderer*) renderer;
 	if (y == 0) { GBAVideoSoftwareRendererLatchHGX4(softwareRenderer); }
+	if (y == 0) { GBAVideoSoftwareRendererLatchOBJ256(softwareRenderer); }
 	bool hold = _hgxHoldTransaction(softwareRenderer, y);
 	if (!hold && y == 0) { GBAVideoSoftwareRendererLatchHGXFrame(softwareRenderer); }
 
@@ -895,6 +899,8 @@ static void GBAVideoSoftwareRendererPutPixels(struct GBAVideoRenderer* renderer,
 	/* A state restore changes game RAM without touching native VRAM caches. */
 	GBAVideoSoftwareRendererResetHGX4(softwareRenderer);
 	GBAVideoSoftwareRendererLatchHGX4(softwareRenderer);
+	GBAVideoSoftwareRendererResetOBJ256(softwareRenderer);
+	GBAVideoSoftwareRendererLatchOBJ256(softwareRenderer);
 
 	const mColor* colorPixels = pixels;
 	unsigned i;

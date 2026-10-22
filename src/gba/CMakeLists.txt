@@ -27,6 +27,7 @@ set(SOURCE_FILES
 	renderers/software-hgx4.c
 	renderers/software-mode0.c
 	renderers/software-obj.c
+	renderers/software-obj256.c
 	renderers/video-software.c
 	savedata.c
 	serialize.c

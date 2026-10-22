@@ -17,6 +17,12 @@
 
 #define ENABLED_MAX 4
 
+void GBAVideoSoftwareRendererResetOBJ256(struct GBAVideoSoftwareRenderer* renderer);
+void GBAVideoSoftwareRendererLatchOBJ256(struct GBAVideoSoftwareRenderer* renderer);
+bool GBAVideoSoftwareRendererGetOBJ256(struct GBAVideoSoftwareRenderer* renderer,
+                                     const struct GBAObj* sprite, unsigned index,
+                                     const uint8_t** pixels, const mColor** palette);
+
 void GBAVideoSoftwareRendererResetHGX4(struct GBAVideoSoftwareRenderer* renderer);
 void GBAVideoSoftwareRendererLatchHGX4(struct GBAVideoSoftwareRenderer* renderer);
 bool GBAVideoSoftwareRendererDrawHGX4(struct GBAVideoSoftwareRenderer* renderer,
