@@ -86,6 +86,9 @@ enum {
 };
 
 enum {
+	GBA_ROM_BANK_REG = 0x0B7FFF00,
+	GBA_ROM_BANK_KEY1 = 0xB128,
+	GBA_ROM_BANK_KEY2 = 0x5A0E,
 	AGB_PRINT_BASE = 0x00FD0000,
 	AGB_PRINT_TOP = 0x00FE0000,
 	AGB_PRINT_PROTECT = 0x00FE2FFE,
@@ -117,6 +120,9 @@ struct GBAMemory {
 	struct GBACartEReader ereader;
 	size_t romSize;
 	uint32_t romMask;
+	uint32_t romBankAdd;
+	uint16_t romKeyVal;
+	uint8_t romKeySeq;
 	uint16_t romID;
 	int fullBios;
 

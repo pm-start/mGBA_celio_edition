@@ -150,7 +150,7 @@ void GBAUnloadROM(struct GBA* gba) {
 			gba->yankedRomSize = 0;
 		}
 #ifndef FIXED_ROM_BUFFER
-		mappedMemoryFree(gba->memory.rom, gba->memory.romSize > GBA_SIZE_ROM0 ? GBA_SIZE_ROM0 * 2 : GBA_SIZE_ROM0);
+		mappedMemoryFree(gba->memory.rom, gba->memory.romSize > GBA_SIZE_ROM0 * 2 ? GBA_SIZE_ROM0 * 4 : (gba->memory.romSize > GBA_SIZE_ROM0 ? GBA_SIZE_ROM0 * 2 : GBA_SIZE_ROM0));
 #endif
 	}
 
@@ -265,6 +265,9 @@ void GBAReset(struct ARMCore* cpu) {
 	if (gba->yankedRomSize) {
 		gba->memory.romSize = gba->yankedRomSize;
 		gba->memory.romMask = toPow2(gba->memory.romSize) - 1;
+		if (gba->memory.romSize > GBA_SIZE_ROM0 * 2) {
+			gba->memory.romMask = GBA_SIZE_ROM0 * 2 - 1;
+		}
 		gba->yankedRomSize = 0;
 	}
 	gba->lastRumble = 0;
@@ -458,6 +461,10 @@ bool GBALoadROM(struct GBA* gba, struct VFile* vf) {
 #else
 			gba->memory.rom = anonymousMemoryMap(GBA_SIZE_ROM0);
 #endif
+		} else if (gba->pristineRomSize == GBA_SIZE_ROM0 * 4) {
+			// 128MiB ROM: banks 1..3 are switched into 0x0A000000-0x0BFFFFFF by writing to GBA_ROM_BANK_REG (only the first 64MiB reach the instruction fetch mask)
+			gba->memory.rom = vf->map(vf, gba->pristineRomSize, MAP_READ);
+			gba->memory.romSize = gba->pristineRomSize;
 		} else if (gba->pristineRomSize == GBA_SIZE_ROM0 * 2) {
 			// 64MiB ROM: second half is mapped at 0x0A000000-0x0BFFFFFF
 			gba->memory.rom = vf->map(vf, gba->pristineRomSize, MAP_READ);
@@ -493,6 +500,11 @@ bool GBALoadROM(struct GBA* gba, struct VFile* vf) {
 	}
 	gba->yankedRomSize = 0;
 	gba->memory.romMask = toPow2(gba->memory.romSize) - 1;
+	if (gba->memory.romSize > GBA_SIZE_ROM0 * 2) {
+		gba->memory.romMask = GBA_SIZE_ROM0 * 2 - 1;
+	}
+	gba->memory.romBankAdd = 0;
+	gba->memory.romKeySeq = 0;
 	gba->romCrc32 = doCrc32(gba->memory.rom, gba->pristineRomSize);
 	if (popcount32(gba->memory.romSize) != 1) {
 		// This ROM is either a bad dump or homebrew. Emulate flash cart behavior.
