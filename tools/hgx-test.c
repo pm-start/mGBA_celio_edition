@@ -546,6 +546,73 @@ static void bgScaled8Tests(struct mCore* core) {
 	memcpy(rom + 0xC800, rom + 0xC100, containerBytes); rom[0xC814] ^= 0x80;
 	STORE_32(0x0800C800, 4, set); h4Draw(renderer, 2, 0, true);
 	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects mutated deflate data");
+	/* A9 v2 adds a bounded night palette and a 68-byte scene night mix while
+	 * preserving v1 tile layout and native screen geometry. */
+	set[0] = 0; set[2] = 0xA9; set[3] = 2; STORE_32(0x0800CB00, 4, set);
+	STORE_32(16, 28, set); STORE_32(1, 32, set); STORE_32(256, 36, set);
+	STORE_32(0x08007F00, 40, set); STORE_32(17, 44, set); STORE_16(0, 0x7C50, rom);
+	for (unsigned y = 0; y < 16; ++y) {
+		memset(rom + 0xCB00 + y * 16, 15, 8); memset(rom + 0xCB00 + y * 16 + 8, 16, 8);
+	}
+	memset(rom + 0x7F00, 0, 512); STORE_16(0x7C00, 0x7F1E, rom); STORE_16(0x7C1F, 0x7F20, rom);
+	STORE_32(68, 8, control); STORE_32(0, 64, scene); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F) && isColor(renderer, 7, 0x03E0), "HGX4 A9 v2 nightMix zero is exact day palette");
+	STORE_32(16, 64, scene); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x7C00) && isColor(renderer, 7, 0x7C1F), "HGX4 A9 v2 nightMix sixteen is exact night palette");
+	hgzFixture(rom + 0xCC00, raw, sizeof(raw)); set[0] = 2; STORE_32(0x0800CC00, 4, set);
+	h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x7C00) && isColor(renderer, 7, 0x7C1F), "HGX4 A9 v2 HGZ1 preserves night palette indices");
+	/* Metadata uses a tagged container base plus a separately validated slice.
+	 * Cell id one exercises nonzero metatile and attribute offsets. */
+	uint8_t metadataRefs[32] = { 0 }, metadataAttrs[8] = { 0 };
+	memcpy(metadataRefs + 16, rom + 0x7C50, 16);
+	memcpy(metadataAttrs + 4, rom + 0x7C60, 4);
+	hgzFixture(rom + 0xF000, rom + 0x7D00, 512);
+	hgzFixture(rom + 0xF100, rom + 0x7F00, 512);
+	hgzFixture(rom + 0xF200, metadataRefs, sizeof(metadataRefs));
+	hgzFixture(rom + 0xF280, metadataAttrs, sizeof(metadataAttrs));
+	STORE_32(0x0800F001, 8, set); STORE_32(0x0800F201, 12, set);
+	STORE_32(0x0800F281, 20, set); STORE_32(0x0800F101, 40, set);
+	STORE_32(1, 4, cells); STORE_32(16, 64, scene); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x7C00) && isColor(renderer, 7, 0x7C1F),
+	        "HGX4 tagged HGZ1 material palette, night palette, metatile and attrs match raw metadata");
+	STORE_32(0x0800F003, 8, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 metadata tag rejects reserved pointer bit one");
+	STORE_32(0x08007D01, 8, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 tagged raw material pointer is rejected instead of masking the tag");
+	uint8_t shortRefs[16] = { 0 }; hgzFixture(rom + 0xF300, shortRefs, sizeof(shortRefs));
+	STORE_32(0x0800F001, 8, set); STORE_32(0x0800F301, 12, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 tagged metatile rejects offset plus length beyond decoded bytes");
+	uint8_t shortPalette[32] = { 0 }; hgzFixture(rom + 0xF380, shortPalette, sizeof(shortPalette));
+	STORE_32(0x0800F201, 12, set); STORE_32(0x0800F381, 40, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 tagged night palette validates color count against decoded bytes");
+	STORE_32(0, 4, cells); STORE_32(0x08007D00, 8, set); STORE_32(0x08007C50, 12, set);
+	STORE_32(0x08007C60, 20, set); STORE_32(0x08007F00, 40, set);
+	set[0] = 0; STORE_32(0x0800CB00, 4, set);
+	STORE_32(8, 64, scene); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, (15 << 10) | 15), "HGX4 A9 v2 interpolates day and night in five-bit channels");
+	STORE_32(16, 32, scene); STORE_32(0x03E0, 36, scene); STORE_32(1, 40, scene);
+	STORE_32(0, 64, scene); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F), "HGX4 A9 v2 day-night palette bypasses legacy DNS tint");
+	STORE_32(0, 32, scene); STORE_32(0, 40, scene);
+	STORE_32(64, 8, control); STORE_32(16, 64, scene); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F), "HGX4 64-byte scene defaults nightMix to day for A9 v2");
+	STORE_32(68, 8, control); STORE_32(17, 64, scene); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 rejects 68-byte scene nightMix above sixteen");
+	STORE_32(0, 64, scene); STORE_32(0, 44, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 v2 rejects zero palette count");
+	STORE_32(257, 44, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 v2 rejects palette count above 256");
+	STORE_32(17, 44, set); STORE_32(0x0800FFF0, 40, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 v2 rejects inaccessible night palette");
+	STORE_32(0x08007F00, 40, set); STORE_32(0x0800FFF0, 8, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 v2 rejects inaccessible day palette");
+	STORE_32(0x08007D00, 8, set); STORE_32(16, 44, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 v2 rejects tile indices outside palette count");
+	STORE_32(17, 44, set); for (unsigned y = 0; y < 16; ++y) { memset(rom + 0xCB00 + y * 16, 0, 8); }
+	h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN && isColor(renderer, 7, 0x03E0), "HGX4 A9 v2 keeps palette index zero transparent");
+	STORE_32(64, 8, control); STORE_32(0, 64, scene);
 	memset(raw, 15, 64); raw[0] = 0; raw[1] = 16;
 	hgzFixture(rom + 0xC900, raw, 64);
 	set[0] = 2; set[2] = 0xA8; set[3] = 1; STORE_32(0x0800C900, 4, set);
@@ -558,6 +625,14 @@ static void bgScaled8Tests(struct mCore* core) {
 	STORE_32(0x08007D00, 8, set); STORE_16(0x001F, 0x7D02, rom);
 	STORE_16(0, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
 	require(isColor(renderer, 0, 0x001F), "HGX4 legacy four-bit HGZ1 matches raw atlas pixels and palette banks");
+	uint8_t legacyPalette[512]; memcpy(legacyPalette, rom + 0x7D00, sizeof(legacyPalette));
+	STORE_16(0x7C1F, 34, legacyPalette); hgzFixture(rom + 0xF400, legacyPalette, sizeof(legacyPalette));
+	STORE_32(0x0800F401, 8, set); STORE_16(0x1000, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x7C1F), "HGX4 tagged HGZ1 legacy palette preserves bank offset semantics");
+	uint8_t oneBank[32] = { 0 }; hgzFixture(rom + 0xF500, oneBank, sizeof(oneBank));
+	STORE_32(0x0800F501, 8, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 tagged legacy palette rejects a bank beyond decoded bytes");
+	STORE_32(0x08007D00, 8, set); STORE_16(0, 0x7C50, rom);
 	STORE_16(1, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
 	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 legacy HGZ1 rejects tile references beyond unpacked atlas");
 	STORE_16(0, 0x7C50, rom);

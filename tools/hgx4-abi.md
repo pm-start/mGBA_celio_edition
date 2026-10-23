@@ -167,3 +167,48 @@ Legacy animation lookup still runs first, so a matching 32-byte animation event
 overrides the compressed base tile exactly as it overrides an uncompressed or
 GBA-LZ base atlas. Compression values zero and one retain their previous raw and
 GBA-LZ meanings; A8 retains zero as raw and adds only value two.
+
+## A9 day/night palettes, version two
+
+A9 version byte +3 equal to `2` extends the version-one descriptor from 40 to
+48 bytes. Every version-one field and raw/HGZ1 tile rule stays at the same
+offset. The added fields are +40 `nightPaletteROMPtr` and +44 `paletteCount`.
+The count is 1 through 256 and includes transparent index zero. The day palette
+at +8 and night palette at +40 each contain exactly `paletteCount` little-endian
+BGR555 entries. Tile indices are unchanged and are never quantized; if any
+index in a resolved square tile is at least `paletteCount`, that material is
+rejected and remains transparent.
+
+The control's sceneBytes field may be 64 for the original scene or 68 for the
+extended scene. The latter appends +64 `nightMix`, from 0 through 16. A 64-byte
+scene behaves as `nightMix=0`. A9 version two mixes each five-bit BGR channel as
+`(day * (16-nightMix) + night * nightMix) >> 4`, making zero exact day and 16
+exact night. Palette index zero remains transparent regardless of its stored
+color. Version two palettes bypass the older DNS palette tint to avoid applying
+the environment twice; the independent scene fade still applies afterward.
+
+The night pointer, day pointer, count, scene mix, HGZ1 size, and every tile
+index are validated before rendering. A9 version one, A8, legacy materials,
+64-byte scenes, doors, animations, and their existing DNS behavior are
+unchanged. The producer may publish day or night directly with mix 0 or 16;
+the ABI does not require or generate additional interpolation tables.
+
+## Tagged material metadata pointers
+
+Tileset pointer fields `+8` (palette), `+12` (metatile references), and `+20`
+(metatile attributes), plus marked A8/A9 `+24` (legacy palette) and A9v2 `+40`
+(night palette), reserve pointer bit zero. An aligned pointer with bit zero clear
+is read directly. Bit zero set means that `pointer & ~3` is the base of an HGZ1
+container containing the complete uncompressed blob.
+
+Consumers pass the base pointer and a separate byte offset. Palette bank
+selection therefore reads `(base, bank * 32, 32)`, and metatile selection reads
+`(base, id * 16, 16)` or `(base, id * 4, 4)`. The decoder validates HGZ1 size,
+codec, exact compressed length, CRC32, and `offset + length` before returning a
+slice. A tagged pointer whose aligned base is not HGZ1 is invalid. Raw pointers
+must remain four-byte aligned.
+
+Logical map, logical attribute, border, tile-atlas, and animation-source
+pointers remain raw and untagged. This keeps native logic buffers and tile
+descriptors byte-addressable while allowing only dedicated material metadata
+to use HGZ1.
