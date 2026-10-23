@@ -1,7 +1,7 @@
 # HGX2 dedicated map renderer
 
 This branch starts from `origin/rom64` at `b66331411` and adds an explicitly
-opted-in background extension for PokemonStart's HG-style maps. Normal ROMs
+opted-in background extension for a ROM hack's HG-style maps. Normal ROMs
 retain the existing rendering and I/O behavior. HGX ROMs use the synchronous
 software renderer, including the matching Qt CPU framebuffer path.
 
