@@ -13,6 +13,8 @@ frame sources reside in immutable ROM. Native BG VRAM/tilemaps are not inputs.
 
 Control (32 bytes): magic `0x34584748`, controlBytes=32, sceneBytes=64,
 cellBytes=16, scenePtr, capabilities, animationLookupPtr, animationLookupCount.
+The optional [OBJ256 extension](obj256-abi.md) expands the control to 40 bytes;
+the field renderer accepts both control sizes.
 
 Scene (64 bytes): serial, enabledBgMask, cellsPtr, columns=16, rows=12,
 signed originScreenX, signed originScreenY, animationTick, dnsCoefficient,
@@ -80,3 +82,88 @@ reset or state restore.
 
 `mgba-hgx-test` exercises the actual software compositor with synthetic ROM
 resources; it does not require a commercial ROM or modify a save file.
+
+## Optional 256-color map chips, version one
+
+A tileset opts in by setting its native padding bytes +2 to `0xA8` and +3 to
+`1`. All other native fields retain their offsets. A marked descriptor has an
+additional +24 legacyPaletteROMPtr, making it 28 bytes. Unmarked tilesets retain
+the original 24-byte layout and four-bit behavior.
+
+The marked tileset's +4 source contains uncompressed 64-byte 8bpp tiles; its
++8 palette contains exactly 256 BGR555 colors, 512 bytes. Both sources reside in
+ROM. Compression byte +0 must be zero in this version. Tile numbers still split
+at 640, secondary tile numbers subtract 640, and H/V flip bits retain their
+native meanings. The reference palette nibble is ignored: each tile uses the
+palette of its own primary/secondary tile role. DNS eligibility uses role bank
+zero for primary, seven for secondary. Alpha depends on the pixel index: zero
+is transparent; every other index is opaque, including RGB black.
+
+Native four-bit tiles, marked eight-bit tiles and private OBJ256 palettes may
+coexist in the same frame. Shared palette snapshots avoid replicating 256
+colors in every tile command. Legacy four-bit tile/palette animation recipes
+are not applied to marked materials; version one displays their static base
+frame. Eight-bit animation/compressed sources need a future explicit recipe.
+
+The optional legacy palette pointer retains the original complete 256-entry
+native banked palette. A native four-bit tile whose palette owner is marked
+uses this legacy array. Explicit 32-byte door frames also remain four-bit and
+select their original bank from this array. An unavailable legacy door palette,
+unsupported marked codec/version, or invalid overlay resource rejects the
+entire overlay before replacing any base-cell command. No native VRAM fallback
+or reinterpretation of 32-byte frame recipes as 64-byte tiles is introduced.
+
+## Optional scaled 256-color map chips, version one
+
+Tag byte +2 may instead be `0xA9`, with version byte +3 equal to `1`. This is a
+40-byte descriptor. Fields +0 through +24 have the same meaning as the A8
+descriptor, including `legacyPaletteROMPtr` at +24. The added fields are:
+
+* +28 `tileSide`: one of 8, 16, 32, 64, or 128 pixels
+* +32 `tileCount`: number of square tiles in the source
+* +36 `resourceBytes`: exactly `tileSide * tileSide * tileCount`
+
+The +4 source is raw, row-major 8bpp indexed data with `tileSide * tileSide`
+bytes per tile. Tile indices and primary/secondary normalization are unchanged,
+so one native 8 by 8 tile reference still selects one square source image.
+The renderer samples that image into the native 8 by 8 footprint using the
+centre of each equal source region. Thus tile sides 8, 16, 32, 64, and 128
+correspond to authored 16, 32, 64, 128, and 256 pixel metatiles while the
+logical cell grid, camera range, and 240 by 160 output remain unchanged.
+
+With compression byte +0 equal to zero, version one accepts the raw 8bpp source
+described above. Zero tile count, unsupported sides, out-of-range tile indices,
+inconsistent byte counts, inaccessible ROM ranges, and unknown A9 versions are
+rejected. Visibility
+checks inspect all `tileSide * tileSide` indices. Palette, index-zero alpha,
+flip, DNS/fade, padding, overlays, doors, animation isolation, and native
+compositor behavior otherwise match A8. This ABI only accepts and samples
+higher-resolution ROM resources; it does not generate those resources or force
+a 4K host output mode.
+
+Compression byte +0 equal to `2` makes +4 point to an HGZ1 container. Its
+20-byte little-endian header is `magic=0x315A4748`, `codec=1`, `rawBytes`,
+`packedBytes`, and `crc32`, followed immediately by one zlib-wrapped deflate
+payload. `rawBytes` must exactly equal descriptor `resourceBytes`; the latter
+continues to describe the unpacked tile atlas. The palette, metatile references,
+attributes, and legacy palette remain uncompressed and keep their existing
+pointers.
+
+The decoder limits a single unpacked HGZ1 resource to 16 MiB and the live HGX4
+resource cache to 1024 entries and 128 MiB. It requires an exact zlib stream end,
+complete input consumption, exact output size, and matching CRC32. Truncated,
+mutated, trailing, oversized, or otherwise inconsistent containers are rejected.
+Stale resources may be evicted only at a frame boundary; resources referenced by
+the current immutable commands retain stable pointers. The cache therefore does
+not fill permanently merely by visiting additional maps.
+
+The same HGZ1 container is also accepted when compression byte +0 is `2` on an
+A8 descriptor or an unmarked legacy 24-byte tileset. For A8, `rawBytes` must be
+a nonzero multiple of 64 and each tile reference selects one 64-byte indexed
+tile. For legacy tilesets it must be a nonzero multiple of 32 and each reference
+selects one native 32-byte four-bit tile. In both cases a reference outside the
+unpacked atlas is rejected. A8 palettes and legacy banked palettes stay raw.
+Legacy animation lookup still runs first, so a matching 32-byte animation event
+overrides the compressed base tile exactly as it overrides an uncompressed or
+GBA-LZ base atlas. Compression values zero and one retain their previous raw and
+GBA-LZ meanings; A8 retains zero as raw and adds only value two.

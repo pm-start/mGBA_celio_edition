@@ -11,9 +11,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef USE_ZLIB
+#include <zlib.h>
+#endif
 
 void GBAVideoSoftwareRendererLatchHGXFrame(struct GBAVideoSoftwareRenderer*);
 void GBAVideoSoftwareRendererLatchHGX4(struct GBAVideoSoftwareRenderer*);
+void GBAVideoSoftwareRendererLatchOBJ256(struct GBAVideoSoftwareRenderer*);
+int GBAVideoSoftwareRendererPreprocessSprite(struct GBAVideoSoftwareRenderer*, struct GBAObj*, int, int);
+void GBAVideoSoftwareRendererPostprocessSprite(struct GBAVideoSoftwareRenderer*, int);
 void GBAVideoSoftwareRendererDrawBackgroundMode0(struct GBAVideoSoftwareRenderer*, struct GBAVideoSoftwareBackground*, int);
 
 static unsigned checks;
@@ -175,6 +181,467 @@ static void h4Tests(struct GBA* gba, struct GBAVideoSoftwareRenderer* renderer) 
 	STORE_32(0, 0, control); /* opt out before original regressions resume */
 	GBAVideoSoftwareRendererLatchHGX4(renderer);
 }
+static void obj256Setup(struct GBAVideoSoftwareRenderer* renderer) {
+	renderer->start = 0; renderer->end = 64; renderer->dispcnt = 0x40;
+	renderer->objOffsetX = 0; renderer->objOffsetY = 0;
+	renderer->target1Obj = false; renderer->target2Bd = false; renderer->forceTarget1 = false;
+	renderer->blendEffect = BLEND_NONE; renderer->bldy = 0;
+	renderer->currentWindow.packed = 0x3F; renderer->currentWindow.priority = 0;
+	renderer->objwin.packed = 0x3F; renderer->objwin.priority = 0;
+	for (unsigned n = 0; n < 4; ++n) { renderer->bg[n].target2 = false; }
+	renderer->normalPalette[0x101] = mColorFrom555(0x03FF);
+}
+static void obj256Entry(uint8_t* ram, unsigned index, const struct GBAObj* sprite, uint32_t palette) {
+	uint8_t* entry = ram + 0x20200 + index * 16;
+	STORE_32(0x08004000, 0, entry); STORE_32(palette, 4, entry);
+	STORE_16(sprite->a, 8, entry); STORE_16(sprite->b, 10, entry); STORE_16(sprite->c, 12, entry);
+	STORE_16(1, 14, entry);
+}
+static void obj256Draw(struct GBAVideoSoftwareRenderer* renderer, unsigned index, int y, bool latch) {
+	if (latch) { GBAVideoSoftwareRendererLatchOBJ256(renderer); }
+	for (unsigned x = 0; x < 240; ++x) { renderer->row[x] = FLAG_UNWRITTEN; renderer->spriteLayer[x] = FLAG_UNWRITTEN; }
+	GBAVideoSoftwareRendererPreprocessSprite(renderer, &renderer->d.oam->obj[index], index, y);
+}
+static bool obj256Color(struct GBAVideoSoftwareRenderer* renderer, unsigned x, unsigned color) {
+	return renderer->spriteLayer[x] != FLAG_UNWRITTEN && (renderer->spriteLayer[x] & 0xFFFFFF) == (mColorFrom555(color) & 0xFFFFFF);
+}
+static void obj256Tests(struct mCore* core) {
+	struct GBA* gba = core->board;
+	uint8_t* fixture = calloc(1, 0x10000);
+	require(fixture != NULL, "allocate original synthetic OBJ256 fixture");
+	memcpy(fixture, gba->memory.rom, 0x4000);
+	memset(fixture + 0x4000, 1, 64);
+	fixture[0x4000] = 0; fixture[0x4001] = 15; fixture[0x4002] = 16; fixture[0x4003] = 255;
+	fixture[0x4038] = 255; fixture[0x4039] = 16;
+	STORE_16(0x03FF, 0x4102, fixture); STORE_16(0x001F, 0x411E, fixture);
+	STORE_16(0x03E0, 0x4120, fixture); STORE_16(0x7C00, 0x42FE, fixture);
+	STORE_16(0x7FFF, 0x4302, fixture); STORE_16(0x7FE0, 0x431E, fixture);
+	STORE_16(0x7C1F, 0x4320, fixture); STORE_16(0x03FF, 0x44FE, fixture);
+	memset(fixture + 0x4500, 15, 64); memset(fixture + 0x4540, 16, 64);
+	memset(fixture + 0x4580, 255, 64); memset(fixture + 0x45C0, 1, 64);
+	memset(fixture + 0x4800, 1, 1024);
+	memset(fixture + 0x4800 + 5 * 64, 16, 64); memset(fixture + 0x4800 + 6 * 64, 255, 64);
+	memset(fixture + 0x4800 + 9 * 64, 15, 64);
+	core->unloadROM(core);
+	require(core->loadROM(core, VFileMemChunk(fixture, 0x10000)), "load original synthetic OBJ256 ROM");
+	free(fixture); core->reset(core);
+	struct GBAVideoSoftwareRenderer* renderer = (struct GBAVideoSoftwareRenderer*) gba->video.renderer;
+	uint8_t* ram = (uint8_t*) gba->memory.wram;
+	uint8_t* control = ram + 0x20000; uint8_t* scene = ram + 0x20100;
+	memset(control, 0, 0x1000);
+	STORE_32(0x34584748, 0, control); STORE_32(40, 4, control); STORE_32(64, 8, control);
+	STORE_32(16, 12, control); STORE_32(1, 20, control);
+	STORE_32(0x02020100, 32, control); STORE_32(32, 36, control);
+	STORE_32(2, 4, scene); STORE_32(0x02020200, 8, scene); STORE_32(16, 12, scene);
+	GBAIOWrite32(gba, 0x3E0, 0x02020000);
+	memset(gba->video.oam.raw, 0, 0x400); memset((uint8_t*) gba->video.vram + 0x10000, 0x11, 0x8000);
+	obj256Setup(renderer);
+	struct GBAObj* sprite = &renderer->d.oam->obj[0];
+	obj256Entry(ram, 0, sprite, 0x08004100);
+	obj256Entry(ram, 1, &renderer->d.oam->obj[1], 0x08004300);
+	/* Extended controls must drive field BG and independent OBJ together. */
+	uint8_t* field = ram + 0x21000; memset(field, 0, 64); memset(ram + 0x22000, 0, 3072);
+	STORE_32(0x02021000, 16, control); STORE_32(4, 4, field);
+	STORE_32(0x02022000, 8, field); STORE_32(16, 12, field); STORE_32(12, 16, field);
+	STORE_32(0x08003000, 0x22000, ram);
+	renderer->bg[2].flags = FLAG_IS_BACKGROUND;
+	h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F), "OBJ256 forty-byte control retains HGX4 field BG material rendering");
+	obj256Draw(renderer, 0, 0, true);
+	require(renderer->spriteLayer[0] == FLAG_UNWRITTEN, "OBJ256 index zero remains transparent");
+	require(obj256Color(renderer, 1, 0x001F), "OBJ256 palette index fifteen retains full color");
+	require(obj256Color(renderer, 2, 0x03E0), "OBJ256 palette index sixteen is not truncated to four bits");
+	require(obj256Color(renderer, 3, 0x7C00), "OBJ256 palette index 255 is rendered from private palette");
+	obj256Draw(renderer, 1, 0, false);
+	require(obj256Color(renderer, 1, 0x7FE0) && obj256Color(renderer, 2, 0x7C1F), "OBJ256 each simultaneous OAM actor has an independent 256-color palette");
+	renderer->d.oam->obj[2].a = 0x2000; renderer->normalPalette[0x111] = mColorFrom555(0x7FFF);
+	obj256Draw(renderer, 2, 0, false);
+	require(obj256Color(renderer, 0, 0x7FFF), "OBJ256 unregistered native eight-bit sprite keeps shared native palette");
+	sprite->b = 0x1000; obj256Entry(ram, 0, sprite, 0x08004100); obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 4, 0x7C00) && obj256Color(renderer, 6, 0x001F) && renderer->spriteLayer[7] == FLAG_UNWRITTEN,
+	        "OBJ256 horizontal flip preserves high indices and transparency");
+	sprite->b = 0x2000; obj256Entry(ram, 0, sprite, 0x08004100); obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 0, 0x7C00) && obj256Color(renderer, 1, 0x03E0), "OBJ256 vertical flip samples final source row");
+	sprite->a = 0x100; sprite->b = 0;
+	renderer->d.oam->mat[0].a = 256; renderer->d.oam->mat[0].b = 0;
+	renderer->d.oam->mat[0].c = 0; renderer->d.oam->mat[0].d = 256;
+	obj256Entry(ram, 0, sprite, 0x08004100); obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 1, 0x001F) && obj256Color(renderer, 3, 0x7C00), "OBJ256 native affine identity preserves private 8bpp material");
+	sprite->a = 0x300; obj256Entry(ram, 0, sprite, 0x08004100); obj256Draw(renderer, 0, 4, true);
+	require(obj256Color(renderer, 5, 0x001F) && obj256Color(renderer, 7, 0x7C00), "OBJ256 affine double-size uses native transformed geometry");
+	sprite->a = 0; sprite->b = 0x4000; obj256Entry(ram, 0, sprite, 0x08004100);
+	STORE_32(0x08004500, 0x20200, ram); renderer->dispcnt = 0; obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 0, 0x001F) && obj256Color(renderer, 8, 0x03E0), "OBJ256 tile-ordered 16 by 16 frame ignores native two-dimensional mapping");
+	obj256Draw(renderer, 0, 8, false);
+	require(obj256Color(renderer, 0, 0x7C00) && obj256Color(renderer, 8, 0x03FF), "OBJ256 multi-tile source uses correct bottom tile-row stride");
+	/* Subsprites crop a parent frame by explicit source tile-row stride. */
+	STORE_32(0x08004940, 0x20200, ram); STORE_16(7, 0x2020E, ram);
+	obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 0, 0x03E0) && obj256Color(renderer, 8, 0x7C00), "OBJ256 sixteen-pixel child crops correct top row from 32-pixel parent");
+	obj256Draw(renderer, 0, 8, false);
+	require(obj256Color(renderer, 0, 0x001F) && obj256Color(renderer, 8, 0x03FF), "OBJ256 child crop skips parent tile-row gap without sampling neighboring tiles");
+	renderer->d.oam->obj[1].b = 0x4010;
+	obj256Entry(ram, 1, &renderer->d.oam->obj[1], 0x08004300);
+	STORE_32(0x08004940, 0x20210, ram); STORE_16(7, 0x2021E, ram);
+	obj256Draw(renderer, 1, 0, true);
+	require(obj256Color(renderer, 16, 0x7C1F) && obj256Color(renderer, 24, 0x03FF), "OBJ256 cropped children retain independent parent palettes");
+	STORE_32(0x0800FF00, 0x20200, ram); obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 0, 0x03FF), "OBJ256 strided source validates full span rather than packed child byte count");
+	sprite->b = 0x8000; obj256Entry(ram, 0, sprite, 0x08004100); STORE_16(3, 0x2020E, ram);
+	obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 0, 0x03FF), "OBJ256 source stride smaller than child width safely falls back");
+	sprite->b = 0; obj256Entry(ram, 0, sprite, 0x08004100); obj256Draw(renderer, 0, 0, true);
+	STORE_32(0x08004300, 0x20204, ram); obj256Draw(renderer, 0, 0, false);
+	require(obj256Color(renderer, 1, 0x001F), "OBJ256 palette changes remain invisible until next frame snapshot");
+	obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 1, 0x7FE0), "OBJ256 next frame switches palette atomically");
+	obj256Entry(ram, 0, sprite, 0x08004100); obj256Draw(renderer, 0, 0, true);
+	sprite->b = 1; obj256Draw(renderer, 0, 0, false);
+	require(obj256Color(renderer, 1, 0x03FF), "OBJ256 reused OAM position signature falls back to native 16-color material");
+	sprite->b = 0; sprite->c = 1; obj256Draw(renderer, 0, 0, false);
+	require(obj256Color(renderer, 0, 0x03FF), "OBJ256 changed native tile binding rejects stale private material");
+	sprite->c = 0; sprite->a = 0x1000; obj256Draw(renderer, 0, 0, false);
+	require(obj256Color(renderer, 0, 0x03FF), "OBJ256 changed native attribute A rejects stale private material");
+	sprite->a = 0;
+	sprite->b = 0; obj256Entry(ram, 0, sprite, 0x08004100); STORE_16(0x11, 0x2020E, ram);
+	obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 0, 0x03FF), "OBJ256 unknown entry flags retain native OBJ behavior");
+	obj256Entry(ram, 0, sprite, 0x08004100); STORE_32(0x0800FFF0, 0x20200, ram);
+	obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 0, 0x03FF), "OBJ256 out-of-range source safely falls back to native OBJ");
+	obj256Entry(ram, 0, sprite, 0x08004100);
+	STORE_32(8, 16, scene); STORE_32(0x03E0, 20, scene); STORE_32(8, 28, scene);
+	obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 3, (7 << 10) | (7 << 5)), "OBJ256 raw private palette receives exact global DNS then fade");
+	STORE_32(0, 16, scene); STORE_32(0, 28, scene);
+	renderer->target1Obj = true; renderer->blendEffect = BLEND_BRIGHTEN; renderer->bldy = 16;
+	obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 3, 0x7FFF), "OBJ256 native brightness compositor applies to private palette");
+	obj256Setup(renderer);
+	sprite->a = 0x400; obj256Entry(ram, 0, sprite, 0x08004100);
+	renderer->bg[0].target2 = true; renderer->bg[0].enabled = 4;
+	obj256Draw(renderer, 0, 0, true);
+	require((renderer->spriteLayer[3] & (FLAG_REBLEND | FLAG_TARGET_1)) == (FLAG_REBLEND | FLAG_TARGET_1),
+	        "OBJ256 native semi-transparent mode retains alpha compositor flags");
+	obj256Setup(renderer);
+	sprite->a = 0x800; obj256Entry(ram, 0, sprite, 0x08004100); renderer->dispcnt |= 0x8000;
+	obj256Draw(renderer, 0, 0, true);
+	require(!(renderer->row[0] & FLAG_OBJWIN) && (renderer->row[3] & FLAG_OBJWIN), "OBJ256 native object-window mode uses eight-bit source alpha");
+	obj256Setup(renderer); sprite->a = 0; obj256Entry(ram, 0, sprite, 0x08004100);
+	STORE_32(0, 20, control); obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 0, 0x03FF), "OBJ256 absent capability leaves original 16-color renderer unchanged");
+	STORE_32(1, 20, control);
+	uint8_t* loadedRom = (uint8_t*) gba->memory.rom; loadedRom[0xB5] = 0;
+	obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 0, 0x03FF), "OBJ256 non-HGX ROM never activates sidecar materials");
+	loadedRom[0xB5] = 'H';
+	void* state = malloc(core->stateSize(core));
+	require(state && core->saveState(core, state), "save original OBJ256 scene state");
+	STORE_32(0, 20, control); obj256Draw(renderer, 0, 0, true);
+	require(core->loadState(core, state), "restore original OBJ256 scene state");
+	obj256Setup(renderer); obj256Draw(renderer, 0, 0, true);
+	require(obj256Color(renderer, 1, 0x001F) && obj256Color(renderer, 3, 0x7C00), "OBJ256 save reload reconstructs private materials from serialized scene");
+	free(state);
+}
+
+static void bg256Tests(struct mCore* core) {
+	struct GBA* gba = core->board;
+	struct GBAVideoSoftwareRenderer* renderer = (struct GBAVideoSoftwareRenderer*) gba->video.renderer;
+	uint8_t* rom = (uint8_t*) gba->memory.rom; uint8_t* ram = (uint8_t*) gba->memory.wram;
+	uint8_t* control = ram + 0x28000; uint8_t* scene = ram + 0x28100; uint8_t* cells = ram + 0x28200;
+	memset(control, 0, 40); memset(scene, 0, 64); memset(cells, 0, 3072);
+	STORE_32(0x34584748, 0, control); STORE_32(40, 4, control); STORE_32(64, 8, control);
+	STORE_32(16, 12, control); STORE_32(0x02028100, 16, control); STORE_32(1, 20, control);
+	STORE_32(0x02020100, 32, control); STORE_32(32, 36, control);
+	STORE_32(14, 4, scene); STORE_32(0x02028200, 8, scene); STORE_32(16, 12, scene); STORE_32(12, 16, scene);
+	for (unsigned n = 0; n < 4; ++n) {
+		unsigned address = 0x5000 + n * 32; memset(rom + address, 0, 24);
+		STORE_32(0x08005100, address + 16, rom); STORE_32(0x08005120, address + 20, rom);
+	}
+	STORE_32(0x08005140, 0x5054, rom); /* layout C: native4 secondary with marked8 primary palette owner */
+	STORE_32(0x08005160, 0x5070, rom); /* layout D: rejected compressed8 overlay */
+	for (unsigned role = 0; role < 2; ++role) {
+		unsigned set = 0x5100 + role * 32; memset(rom + set, 0, 28);
+		rom[set + 2] = 0xA8; rom[set + 3] = 1;
+		STORE_32(0x08006000 + role * 512, set + 4, rom);
+		STORE_32(0x08007000 + role * 512, set + 8, rom);
+		STORE_32(0x08007800 + role * 64, set + 12, rom);
+		STORE_32(0x08007880 + role * 4, set + 20, rom);
+		STORE_32(0x08007400 + role * 512, set + 24, rom);
+		memset(rom + 0x6000 + role * 512, 1, 64);
+		uint8_t* pixels = rom + 0x6000 + role * 512;
+		pixels[0] = 0; pixels[1] = 15; pixels[2] = 16; pixels[3] = 255; pixels[4] = 18;
+		pixels[56] = 16; pixels[57] = 255;
+		memset(pixels + 64, 17, 64); memset(pixels + 128, 0, 64);
+		memset(rom + 0x7000 + role * 512, 0, 512); memset(rom + 0x7400 + role * 512, 0, 512);
+		STORE_16(role ? 0x7FE0 : 0x001F, 0x701E + role * 512, rom);
+		STORE_16(role ? 0x7C1F : 0x03E0, 0x7020 + role * 512, rom);
+		STORE_16(role ? 0x03FF : 0x7C00, 0x71FE + role * 512, rom);
+		STORE_16(0x7FFF, 0x7002 + role * 512, rom); STORE_16(0x03FF, 0x7022 + role * 512, rom);
+		for (unsigned q = 0; q < 8; ++q) {
+			unsigned index = q < 4 ? (q == 1 ? 1 : 0) : 2;
+			unsigned flip = q == 2 ? 0x400 : q == 3 ? 0x800 : 0;
+			STORE_16((role ? 640 : 0) + index + flip + 0xF000, 0x7800 + role * 64 + q * 2, rom);
+		}
+		STORE_32(0, 0x7880 + role * 4, rom);
+	}
+	memset(rom + 0x5140, 0, 28); STORE_32(0x08006400, 0x5144, rom);
+	STORE_32(0x08007900, 0x514C, rom); STORE_32(0x08007920, 0x5154, rom);
+	memset(rom + 0x6400, 0x11, 32); STORE_32(0, 0x7920, rom);
+	for (unsigned q = 0; q < 8; ++q) { STORE_16(0x3280, 0x7900 + q * 2, rom); }
+	STORE_16(0x03FF, 0x7462, rom); STORE_16(0x7C1F, 0x7464, rom); /* legacy bank3 colors1/2 */
+	memcpy(rom + 0x5160, rom + 0x5100, 28); rom[0x5160] = 1;
+	for (unsigned n = 0; n < 4; ++n) { STORE_32(n == 2 ? 0x08005040 : 0x08005000, n * 16, cells); }
+	STORE_32(640, 20, cells); STORE_32(640, 36, cells);
+	GBAIOWrite32(gba, 0x3E0, 0x02028000); obj256Setup(renderer);
+	for (unsigned bg = 1; bg < 4; ++bg) { renderer->bg[bg].flags = FLAG_IS_BACKGROUND; }
+	h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "BG256 index zero remains transparent");
+	require(isColor(renderer, 1, 0x001F) && isColor(renderer, 2, 0x03E0) && isColor(renderer, 3, 0x7C00), "BG256 map chips render palette indices 15, 16 and 255 without truncation");
+	require(renderer->row[4] != FLAG_UNWRITTEN && isColor(renderer, 4, 0), "BG256 nonzero palette index remains opaque even when its RGB color is black");
+	require(isColor(renderer, 8, 0x03FF), "BG256 tile indices advance by 64 bytes");
+	require(isColor(renderer, 17, 0x7FE0) && isColor(renderer, 18, 0x7C1F) && isColor(renderer, 19, 0x03FF), "BG256 secondary role uses its own 256 palette and local tile index");
+	require(isColor(renderer, 32, 0x03FF), "BG256 mixed native4 source uses retained legacy palette of marked8 palette owner");
+	require(isColor(renderer, 49, 0x001F) && isColor(renderer, 51, 0x7C00), "BG256 identical current and foreign materials share one resolver");
+	h4Draw(renderer, 2, 8, false);
+	require(isColor(renderer, 4, 0x7C00) && isColor(renderer, 6, 0x001F) && renderer->row[7] == FLAG_UNWRITTEN, "BG256 horizontal flip preserves eight-bit alpha and colors");
+	require(isColor(renderer, 8, 0x03E0) && isColor(renderer, 9, 0x7C00), "BG256 vertical flip uses eight-byte source rows");
+	h4Draw(renderer, 3, 0, false); require(renderer->row[1] == FLAG_UNWRITTEN, "BG256 unused plane is transparent despite opaque authored tile zero");
+	STORE_32(8, 32, scene); STORE_32(0x03E0, 36, scene); STORE_32(1, 40, scene);
+	h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 3, (15 << 10) | (15 << 5)) && isColor(renderer, 19, 0x03FF), "BG256 DNS mask uses role banks zero and seven while reference palette nibble is ignored");
+	STORE_32(8, 60, scene); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 3, (7 << 10) | (7 << 5)), "BG256 shared palettes receive native five-bit DNS then fade");
+	STORE_32(0, 32, scene); STORE_32(0, 60, scene);
+	STORE_32(0x08000BAD, 0x5110, rom); STORE_32(0x08007A00, 24, control); STORE_32(1, 28, control);
+	STORE_32(0x08000BAD, 0x7A00, rom); STORE_32(0, 0x7A04, rom); STORE_32(0x08007A20, 0x7A08, rom);
+	STORE_32(16, 0x7A20, rom); STORE_32(1, 0x7A24, rom); STORE_32(0x08007A40, 0x7A28, rom);
+	STORE_32(0, 0x7A2C, rom); STORE_32(0, 0x7A30, rom);
+	STORE_32(0, 0x7A40, rom); STORE_32(1, 0x7A44, rom); STORE_32(1, 0x7A48, rom); STORE_32(0x08007A60, 0x7A4C, rom);
+	STORE_32(0, 0x7A60, rom); STORE_32(0x08007A80, 0x7A64, rom); memset(rom + 0x7A80, 0x22, 32);
+	h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 1, 0x001F) && isColor(renderer, 3, 0x7C00), "BG256 legacy 32-byte animation recipe never overwrites marked raw8 base frame");
+	uint8_t* overlay = ram + 0x29000; memset(overlay, 0, 36);
+	STORE_32(0x08005000, 8, overlay); STORE_32(0x200, 12, overlay); STORE_32(0x08007B00, 32, overlay);
+	for (unsigned q = 0; q < 4; ++q) { STORE_16(0x33F8, 16 + q * 2, overlay); }
+	memset(rom + 0x7B00, 0x22, 32); STORE_32(0x02029000, 44, scene); STORE_32(1, 48, scene);
+	h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x7C1F) && isColor(renderer, 7, 0x7C1F), "BG256 native door keeps explicit four-bit frame and original banked legacy palette");
+	STORE_32(0, 0x5118, rom); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN && isColor(renderer, 1, 0x001F), "BG256 missing legacy door palette rejects overlay and preserves authored base cell");
+	STORE_32(0x08007400, 0x5118, rom);
+	STORE_32(0x08005060, 8, overlay); STORE_32(0, 32, overlay);
+	for (unsigned q = 0; q < 4; ++q) { STORE_16(0, 16 + q * 2, overlay); }
+	h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 1, 0x001F), "BG256 unsupported compressed8 overlay preserves valid base cell");
+	rom[0x5160] = 0; rom[0x5163] = 2; h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 1, 0x001F), "BG256 unknown marked version rejects overlay without decoding as native4");
+	STORE_32(0, 48, scene); STORE_32(0, 28, control); STORE_32(0, 0x5110, rom);
+	/* Compose a high-index private OBJ on top of a high-index field tile. */
+	h4Draw(renderer, 2, 0, true); GBAVideoSoftwareRendererLatchOBJ256(renderer);
+	for (unsigned x = 0; x < 240; ++x) { renderer->spriteLayer[x] = FLAG_UNWRITTEN; }
+	GBAVideoSoftwareRendererPreprocessSprite(renderer, &renderer->d.oam->obj[1], 1, 0);
+	GBAVideoSoftwareRendererPostprocessSprite(renderer, 0);
+	require(isColor(renderer, 17, 0x7C1F), "BG256 and independent OBJ256 compose together with native object priority");
+	void* state = malloc(core->stateSize(core)); require(state && core->saveState(core, state), "save simultaneous BG256 and OBJ256 scene");
+	STORE_32(0, 4, scene); h4Draw(renderer, 2, 0, true);
+	require(core->loadState(core, state), "restore simultaneous BG256 and OBJ256 scene");
+	obj256Setup(renderer); renderer->bg[2].flags = FLAG_IS_BACKGROUND;
+	h4Draw(renderer, 2, 0, true); require(isColor(renderer, 3, 0x7C00) && isColor(renderer, 19, 0x03FF), "BG256 reload reconstructs role palettes and material caches");
+	free(state);
+}
+
+#ifdef USE_ZLIB
+static unsigned hgzFixture(uint8_t* destination, const uint8_t* raw, unsigned rawBytes) {
+	uLongf packedBytes = compressBound(rawBytes);
+	int status = compress2(destination + 20, &packedBytes, raw, rawBytes, Z_BEST_COMPRESSION);
+	require(status == Z_OK && packedBytes <= UINT32_MAX, "create synthetic HGZ1 zlib payload");
+	STORE_32(0x315A4748, 0, destination); STORE_32(1, 4, destination);
+	STORE_32(rawBytes, 8, destination); STORE_32((uint32_t) packedBytes, 12, destination);
+	STORE_32(crc32(0, raw, rawBytes), 16, destination);
+	return (unsigned) packedBytes + 20;
+}
+#endif
+
+static void bgScaled8Tests(struct mCore* core) {
+	struct GBA* gba = core->board;
+	struct GBAVideoSoftwareRenderer* renderer = (struct GBAVideoSoftwareRenderer*) gba->video.renderer;
+	uint8_t* rom = (uint8_t*) gba->memory.rom;
+	uint8_t* ram = (uint8_t*) gba->memory.wram;
+	uint8_t* control = ram + 0x28000;
+	uint8_t* scene = ram + 0x28100;
+	uint8_t* cells = ram + 0x28200;
+	uint8_t* set = rom + 0x7C20;
+	memset(control, 0, 40); memset(scene, 0, 64); memset(cells, 0, 3072);
+	STORE_32(0x34584748, 0, control); STORE_32(40, 4, control); STORE_32(64, 8, control);
+	STORE_32(16, 12, control); STORE_32(0x02028100, 16, control); STORE_32(1, 20, control);
+	STORE_32(14, 4, scene); STORE_32(0x02028200, 8, scene); STORE_32(16, 12, scene); STORE_32(12, 16, scene);
+	memset(rom + 0x7C00, 0, 0x400);
+	STORE_32(0x08007C20, 0x7C10, rom); STORE_32(0x08007C20, 0x7C14, rom);
+	set[2] = 0xA9; set[3] = 1;
+	STORE_32(0x08008000, 4, set); STORE_32(0x08007D00, 8, set);
+	STORE_32(0x08007C50, 12, set); STORE_32(0x08007C60, 20, set); STORE_32(0x08007D00, 24, set);
+	STORE_32(1, 32, set); STORE_32(0, 0x7C60, rom);
+	for (unsigned q = 0; q < 8; ++q) { STORE_16(0, 0x7C50 + q * 2, rom); }
+	STORE_16(0x001F, 0x7D1E, rom); STORE_16(0x03E0, 0x7D20, rom);
+	STORE_32(0x08007C00, 0, cells);
+	GBAIOWrite32(gba, 0x3E0, 0x02028000);
+	for (unsigned bg = 1; bg < 4; ++bg) { renderer->bg[bg].flags = FLAG_IS_BACKGROUND; }
+	const unsigned sides[] = { 8, 16, 32, 64, 128 };
+	for (unsigned n = 0; n < sizeof(sides) / sizeof(sides[0]); ++n) {
+		unsigned side = sides[n], bytes = side * side;
+		STORE_32(side, 28, set); STORE_32(bytes, 36, set);
+		for (unsigned y = 0; y < side; ++y) {
+			memset(rom + 0x8000 + y * side, 15, side / 2);
+			memset(rom + 0x8000 + y * side + side / 2, 16, side / 2);
+		}
+		h4Draw(renderer, 2, 0, true);
+		require(isColor(renderer, 0, 0x001F) && isColor(renderer, 7, 0x03E0),
+		        "HGX4 A9 scaled raw8 tile uses centre sampling without changing native footprint");
+		STORE_16(0x400, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+		require(isColor(renderer, 0, 0x03E0) && isColor(renderer, 7, 0x001F),
+		        "HGX4 A9 horizontal flip is applied in logical native coordinates");
+		STORE_16(0, 0x7C50, rom);
+	}
+	STORE_32(12, 28, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 rejects unsupported tile side");
+	STORE_32(16, 28, set); STORE_32(255, 36, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 rejects inconsistent resource byte count");
+	STORE_32(256, 36, set); STORE_16(1, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 rejects tile indices outside tileCount");
+	STORE_16(0, 0x7C50, rom); set[3] = 2; h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 rejects unknown descriptor versions");
+	set[3] = 1; set[0] = 1; h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 version one rejects unsupported compression values");
+#ifdef USE_ZLIB
+	uint8_t raw[256];
+	for (unsigned y = 0; y < 16; ++y) {
+		memset(raw + y * 16, 15, 8); memset(raw + y * 16 + 8, 16, 8);
+	}
+	unsigned containerBytes = hgzFixture(rom + 0xC100, raw, sizeof(raw));
+	set[0] = 2; set[3] = 1; STORE_32(16, 28, set); STORE_32(1, 32, set); STORE_32(256, 36, set);
+	STORE_32(0x0800C100, 4, set); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F) && isColor(renderer, 7, 0x03E0),
+	        "HGX4 A9 HGZ1 output is pixel-equivalent to raw row-major input");
+	memcpy(rom + 0xC200, rom + 0xC100, containerBytes); STORE_32(0, 0xC200, rom);
+	STORE_32(0x0800C200, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects bad magic");
+	memcpy(rom + 0xC300, rom + 0xC100, containerBytes); STORE_32(2, 0xC304, rom);
+	STORE_32(0x0800C300, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects unknown codec");
+	memcpy(rom + 0xC400, rom + 0xC100, containerBytes); STORE_32(255, 0xC408, rom);
+	STORE_32(0x0800C400, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects raw size mismatch");
+	uint32_t packedBytes, checksum; LOAD_32(packedBytes, 0xC10C, rom); LOAD_32(checksum, 0xC110, rom);
+	memcpy(rom + 0xC500, rom + 0xC100, containerBytes); STORE_32(packedBytes - 1, 0xC50C, rom);
+	STORE_32(0x0800C500, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects truncated zlib payload");
+	memcpy(rom + 0xC600, rom + 0xC100, containerBytes); rom[0xC600 + containerBytes] = 0;
+	STORE_32(packedBytes + 1, 0xC60C, rom);
+	STORE_32(0x0800C600, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects trailing payload bytes");
+	memcpy(rom + 0xC700, rom + 0xC100, containerBytes); STORE_32(checksum ^ 1, 0xC710, rom);
+	STORE_32(0x0800C700, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects CRC32 mismatch");
+	memcpy(rom + 0xC800, rom + 0xC100, containerBytes); rom[0xC814] ^= 0x80;
+	STORE_32(0x0800C800, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects mutated deflate data");
+	memset(raw, 15, 64); raw[0] = 0; raw[1] = 16;
+	hgzFixture(rom + 0xC900, raw, 64);
+	set[0] = 2; set[2] = 0xA8; set[3] = 1; STORE_32(0x0800C900, 4, set);
+	STORE_16(0, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN && isColor(renderer, 1, 0x03E0),
+	        "HGX4 A8 HGZ1 matches raw 64-byte indexed tile semantics");
+	uint8_t raw4[32]; memset(raw4, 0x11, sizeof(raw4));
+	hgzFixture(rom + 0xCA00, raw4, sizeof(raw4));
+	set[0] = 2; set[2] = 0; set[3] = 0; STORE_32(0x0800CA00, 4, set);
+	STORE_32(0x08007D00, 8, set); STORE_16(0x001F, 0x7D02, rom);
+	STORE_16(0, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F), "HGX4 legacy four-bit HGZ1 matches raw atlas pixels and palette banks");
+	STORE_16(1, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 legacy HGZ1 rejects tile references beyond unpacked atlas");
+	STORE_16(0, 0x7C50, rom);
+	/* More than the former 32-entry cache limit must coexist in one immutable
+	 * scene without turning later cells transparent. */
+	memset(cells, 0, 3072); memset(raw, 15, 64);
+	for (unsigned n = 0; n < 40; ++n) {
+		unsigned layoutAddress = 0xD000 + n * 24;
+		unsigned setAddress = 0xD400 + n * 40;
+		unsigned refsAddress = 0xDB00 + n * 16;
+		unsigned attrsAddress = 0xDE00 + n * 4;
+		unsigned containerAddress = 0xE000 + n * 64;
+		memset(rom + layoutAddress, 0, 24); memset(rom + setAddress, 0, 40);
+		STORE_32(0x08000000 + setAddress, layoutAddress + 16, rom);
+		STORE_32(0x08000000 + setAddress, layoutAddress + 20, rom);
+		rom[setAddress] = 2; rom[setAddress + 2] = 0xA9; rom[setAddress + 3] = 1;
+		STORE_32(0x08000000 + containerAddress, setAddress + 4, rom);
+		STORE_32(0x08007D00, setAddress + 8, rom); STORE_32(0x08000000 + refsAddress, setAddress + 12, rom);
+		STORE_32(0x08000000 + attrsAddress, setAddress + 20, rom); STORE_32(0x08007D00, setAddress + 24, rom);
+		STORE_32(8, setAddress + 28, rom); STORE_32(1, setAddress + 32, rom); STORE_32(64, setAddress + 36, rom);
+		memset(rom + refsAddress, 0, 16); STORE_32(0, attrsAddress, rom);
+		hgzFixture(rom + containerAddress, raw, 64);
+		STORE_32(0x08000000 + layoutAddress, n * 16, cells);
+	}
+	h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F) && isColor(renderer, 14 * 16, 0x001F),
+	        "HGX4 A9 retains more than 32 compressed resources in one frame");
+#endif
+	STORE_32(0, 0, control); GBAVideoSoftwareRendererLatchHGX4(renderer);
+}
+
+static void paletteCapacityTest(struct mCore* core) {
+	struct GBA* gba = core->board;
+	struct GBAVideoSoftwareRenderer* renderer = (struct GBAVideoSoftwareRenderer*) gba->video.renderer;
+	uint8_t* rom = (uint8_t*) gba->memory.rom; uint8_t* ram = (uint8_t*) gba->memory.wram;
+	uint8_t* control = ram + 0x30000; uint8_t* scene = ram + 0x30040; uint8_t* cells = ram + 0x30100;
+	memset(control, 0, 32); memset(scene, 0, 64); memset(cells, 0, 3072);
+	STORE_32(0x34584748, 0, control); STORE_32(32, 4, control); STORE_32(64, 8, control); STORE_32(16, 12, control);
+	STORE_32(0x02030040, 16, control); STORE_32(14, 4, scene); STORE_32(0x02030100, 8, scene);
+	STORE_32(16, 12, scene); STORE_32(12, 16, scene);
+	/* 192 owner layouts, each with different primary/secondary palettes.
+	 * Their complete native palette arrays may overlap; each used global bank
+	 * is a distinct, valid 32-byte ROM slice. All 384 commands are resident. */
+	for (unsigned cell = 0; cell < 192; ++cell) {
+		unsigned layout = 0xB200 + cell * 24; memset(rom + layout, 0, 24);
+		for (unsigned role = 0; role < 2; ++role) {
+			unsigned set = 0xC400 + (cell * 2 + role) * 24;
+			unsigned palette = 0x8000 + (cell * 2 + role) * 32;
+			memset(rom + set, 0, 24); memset(rom + palette, 0, 32);
+			STORE_32(0x08000000 + set, layout + 16 + role * 4, rom);
+			STORE_32(0x0800E820, set + 4, rom);
+			STORE_32(0x08000000 + palette - role * 7 * 32, set + 8, rom);
+			STORE_32(0x0800E800, set + 12, rom); STORE_32(0x0800E810, set + 20, rom);
+			STORE_16((role ? 0x4000 : 0) + cell + 1, palette + 2, rom);
+		}
+		STORE_32(0x08000000 + layout, cell * 16, cells);
+	}
+	for (unsigned q = 0; q < 4; ++q) { STORE_16(0, 0xE800 + q * 2, rom); STORE_16(0x7280, 0xE808 + q * 2, rom); }
+	STORE_32(0, 0xE810, rom); memset(rom + 0xE820, 0x11, 32);
+	GBAIOWrite32(gba, 0x3E0, 0x02030000); obj256Setup(renderer);
+	renderer->bg[1].flags = FLAG_IS_BACKGROUND; renderer->bg[2].flags = FLAG_IS_BACKGROUND;
+	bool seen[192][2] = { { false } }; bool correct = true;
+	/* Four camera positions expose the whole retained 16x12 cell scene through
+	 * the native 240x160 viewport, including both late-allocated palette roles. */
+	for (unsigned view = 0; view < 4; ++view) {
+		unsigned firstColumn = view & 1, firstRow = (view >> 1) * 2;
+		STORE_32((uint32_t) -(int32_t) (firstColumn * 16), 20, scene);
+		STORE_32((uint32_t) -(int32_t) (firstRow * 16), 24, scene);
+		GBAVideoSoftwareRendererLatchHGX4(renderer);
+		for (unsigned role = 0; role < 2; ++role) {
+			for (unsigned row = firstRow; row < firstRow + 10; ++row) {
+				h4Draw(renderer, role ? 1 : 2, (row - firstRow) * 16, false);
+				for (unsigned col = firstColumn; col < firstColumn + 15; ++col) {
+					unsigned cell = row * 16 + col;
+					correct &= isColor(renderer, (col - firstColumn) * 16, (role ? 0x4000 : 0) + cell + 1);
+					seen[cell][role] = true;
+				}
+			}
+		}
+	}
+	for (unsigned cell = 0; cell < 192; ++cell) { correct &= seen[cell][0] && seen[cell][1]; }
+	require(correct, "HGX4 one retained scene preserves all 384 distinct primary and secondary palettes across camera views");
+}
+
 int main(void) {
     uint8_t* rom = calloc(1, 0x4000);
     require(rom != NULL, "allocate artificial ROM");
@@ -731,6 +1198,10 @@ int main(void) {
             "HGX2 rendering remains unchanged even with odd generations and unrelated high bits");
 	free(reference);
 	h4Tests(gba, renderer);
+	obj256Tests(core);
+	bg256Tests(core);
+	bgScaled8Tests(core);
+	paletteCapacityTest(core);
     uint8_t* ordinary = malloc(0x4000);
     require(ordinary != NULL, "allocate ordinary-ROM opt-out regression");
     memcpy(ordinary, gba->memory.rom, 0x4000);

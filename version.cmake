@@ -53,6 +53,9 @@ if(NOT GIT_BRANCH)
 	set(GIT_BRANCH "(unknown)")
 endif()
 
+set(CELIO_VERSION "0.11.0-clio.1" CACHE STRING "Dedicated mgba-celio application version")
+set(VERSION_STRING "${CELIO_VERSION}")
+
 if(DEFINED PRINT_STRING)
 	if(NOT DEFINED ${PRINT_STRING})
 		load_cache($ENV{PWD} READ_WITH_PREFIX "" ${PRINT_STRING})

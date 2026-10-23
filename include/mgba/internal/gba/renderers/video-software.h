@@ -83,6 +83,7 @@ struct GBAVideoSoftwareRenderer {
 	struct GBAVideoRenderer d;
 	/* Independent HGX4 scene/material renderer; rebuildable host state only. */
 	struct GBAVideoHGX4* hgx4;
+	struct GBAVideoOBJ256* obj256;
 	/* Host-only, rebuildable LZ resources for HGX2. No virtual IDs enter states. */
 	uint8_t* hgxDecoded[64];
 	uint32_t hgxSources[64];
