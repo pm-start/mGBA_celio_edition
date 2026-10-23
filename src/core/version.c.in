@@ -10,5 +10,5 @@ MGBA_EXPORT const char* const gitCommitShort = "${GIT_COMMIT_SHORT}";
 MGBA_EXPORT const char* const gitBranch = "${GIT_BRANCH}";
 MGBA_EXPORT const int gitRevision = ${GIT_REV};
 MGBA_EXPORT const char* const binaryName = "${BINARY_NAME}";
-MGBA_EXPORT const char* const projectName = "${PROJECT_NAME}";
+MGBA_EXPORT const char* const projectName = "mgba-clio";
 MGBA_EXPORT const char* const projectVersion = "${VERSION_STRING}";

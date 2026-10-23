@@ -1289,13 +1289,7 @@ void Window::updateTitle(float fps) {
 			}
 		}
 	}
-	if (title.isNull()) {
-		setWindowTitle(tr("%1 - %2").arg(projectName).arg(projectVersion));
-	} else if (fps < 0) {
-		setWindowTitle(tr("%1 - %2 - %3").arg(projectName).arg(title).arg(projectVersion));
-	} else {
-		setWindowTitle(tr("%1 - %2 (%3 fps) - %4").arg(projectName).arg(title).arg(fps).arg(projectVersion));
-	}
+	setWindowTitle(QStringLiteral("%1 ver: %2").arg(projectName).arg(projectVersion));
 }
 
 void Window::openStateWindow(LoadSave ls) {

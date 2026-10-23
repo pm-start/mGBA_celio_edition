@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef USE_ZLIB
+#include <zlib.h>
+#endif
 
 void GBAVideoSoftwareRendererLatchHGXFrame(struct GBAVideoSoftwareRenderer*);
 void GBAVideoSoftwareRendererLatchHGX4(struct GBAVideoSoftwareRenderer*);
@@ -446,6 +449,144 @@ static void bg256Tests(struct mCore* core) {
 	obj256Setup(renderer); renderer->bg[2].flags = FLAG_IS_BACKGROUND;
 	h4Draw(renderer, 2, 0, true); require(isColor(renderer, 3, 0x7C00) && isColor(renderer, 19, 0x03FF), "BG256 reload reconstructs role palettes and material caches");
 	free(state);
+}
+
+#ifdef USE_ZLIB
+static unsigned hgzFixture(uint8_t* destination, const uint8_t* raw, unsigned rawBytes) {
+	uLongf packedBytes = compressBound(rawBytes);
+	int status = compress2(destination + 20, &packedBytes, raw, rawBytes, Z_BEST_COMPRESSION);
+	require(status == Z_OK && packedBytes <= UINT32_MAX, "create synthetic HGZ1 zlib payload");
+	STORE_32(0x315A4748, 0, destination); STORE_32(1, 4, destination);
+	STORE_32(rawBytes, 8, destination); STORE_32((uint32_t) packedBytes, 12, destination);
+	STORE_32(crc32(0, raw, rawBytes), 16, destination);
+	return (unsigned) packedBytes + 20;
+}
+#endif
+
+static void bgScaled8Tests(struct mCore* core) {
+	struct GBA* gba = core->board;
+	struct GBAVideoSoftwareRenderer* renderer = (struct GBAVideoSoftwareRenderer*) gba->video.renderer;
+	uint8_t* rom = (uint8_t*) gba->memory.rom;
+	uint8_t* ram = (uint8_t*) gba->memory.wram;
+	uint8_t* control = ram + 0x28000;
+	uint8_t* scene = ram + 0x28100;
+	uint8_t* cells = ram + 0x28200;
+	uint8_t* set = rom + 0x7C20;
+	memset(control, 0, 40); memset(scene, 0, 64); memset(cells, 0, 3072);
+	STORE_32(0x34584748, 0, control); STORE_32(40, 4, control); STORE_32(64, 8, control);
+	STORE_32(16, 12, control); STORE_32(0x02028100, 16, control); STORE_32(1, 20, control);
+	STORE_32(14, 4, scene); STORE_32(0x02028200, 8, scene); STORE_32(16, 12, scene); STORE_32(12, 16, scene);
+	memset(rom + 0x7C00, 0, 0x400);
+	STORE_32(0x08007C20, 0x7C10, rom); STORE_32(0x08007C20, 0x7C14, rom);
+	set[2] = 0xA9; set[3] = 1;
+	STORE_32(0x08008000, 4, set); STORE_32(0x08007D00, 8, set);
+	STORE_32(0x08007C50, 12, set); STORE_32(0x08007C60, 20, set); STORE_32(0x08007D00, 24, set);
+	STORE_32(1, 32, set); STORE_32(0, 0x7C60, rom);
+	for (unsigned q = 0; q < 8; ++q) { STORE_16(0, 0x7C50 + q * 2, rom); }
+	STORE_16(0x001F, 0x7D1E, rom); STORE_16(0x03E0, 0x7D20, rom);
+	STORE_32(0x08007C00, 0, cells);
+	GBAIOWrite32(gba, 0x3E0, 0x02028000);
+	for (unsigned bg = 1; bg < 4; ++bg) { renderer->bg[bg].flags = FLAG_IS_BACKGROUND; }
+	const unsigned sides[] = { 8, 16, 32, 64, 128 };
+	for (unsigned n = 0; n < sizeof(sides) / sizeof(sides[0]); ++n) {
+		unsigned side = sides[n], bytes = side * side;
+		STORE_32(side, 28, set); STORE_32(bytes, 36, set);
+		for (unsigned y = 0; y < side; ++y) {
+			memset(rom + 0x8000 + y * side, 15, side / 2);
+			memset(rom + 0x8000 + y * side + side / 2, 16, side / 2);
+		}
+		h4Draw(renderer, 2, 0, true);
+		require(isColor(renderer, 0, 0x001F) && isColor(renderer, 7, 0x03E0),
+		        "HGX4 A9 scaled raw8 tile uses centre sampling without changing native footprint");
+		STORE_16(0x400, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+		require(isColor(renderer, 0, 0x03E0) && isColor(renderer, 7, 0x001F),
+		        "HGX4 A9 horizontal flip is applied in logical native coordinates");
+		STORE_16(0, 0x7C50, rom);
+	}
+	STORE_32(12, 28, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 rejects unsupported tile side");
+	STORE_32(16, 28, set); STORE_32(255, 36, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 rejects inconsistent resource byte count");
+	STORE_32(256, 36, set); STORE_16(1, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 rejects tile indices outside tileCount");
+	STORE_16(0, 0x7C50, rom); set[3] = 2; h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 rejects unknown descriptor versions");
+	set[3] = 1; set[0] = 1; h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 version one rejects unsupported compression values");
+#ifdef USE_ZLIB
+	uint8_t raw[256];
+	for (unsigned y = 0; y < 16; ++y) {
+		memset(raw + y * 16, 15, 8); memset(raw + y * 16 + 8, 16, 8);
+	}
+	unsigned containerBytes = hgzFixture(rom + 0xC100, raw, sizeof(raw));
+	set[0] = 2; set[3] = 1; STORE_32(16, 28, set); STORE_32(1, 32, set); STORE_32(256, 36, set);
+	STORE_32(0x0800C100, 4, set); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F) && isColor(renderer, 7, 0x03E0),
+	        "HGX4 A9 HGZ1 output is pixel-equivalent to raw row-major input");
+	memcpy(rom + 0xC200, rom + 0xC100, containerBytes); STORE_32(0, 0xC200, rom);
+	STORE_32(0x0800C200, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects bad magic");
+	memcpy(rom + 0xC300, rom + 0xC100, containerBytes); STORE_32(2, 0xC304, rom);
+	STORE_32(0x0800C300, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects unknown codec");
+	memcpy(rom + 0xC400, rom + 0xC100, containerBytes); STORE_32(255, 0xC408, rom);
+	STORE_32(0x0800C400, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects raw size mismatch");
+	uint32_t packedBytes, checksum; LOAD_32(packedBytes, 0xC10C, rom); LOAD_32(checksum, 0xC110, rom);
+	memcpy(rom + 0xC500, rom + 0xC100, containerBytes); STORE_32(packedBytes - 1, 0xC50C, rom);
+	STORE_32(0x0800C500, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects truncated zlib payload");
+	memcpy(rom + 0xC600, rom + 0xC100, containerBytes); rom[0xC600 + containerBytes] = 0;
+	STORE_32(packedBytes + 1, 0xC60C, rom);
+	STORE_32(0x0800C600, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects trailing payload bytes");
+	memcpy(rom + 0xC700, rom + 0xC100, containerBytes); STORE_32(checksum ^ 1, 0xC710, rom);
+	STORE_32(0x0800C700, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects CRC32 mismatch");
+	memcpy(rom + 0xC800, rom + 0xC100, containerBytes); rom[0xC814] ^= 0x80;
+	STORE_32(0x0800C800, 4, set); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 A9 HGZ1 rejects mutated deflate data");
+	memset(raw, 15, 64); raw[0] = 0; raw[1] = 16;
+	hgzFixture(rom + 0xC900, raw, 64);
+	set[0] = 2; set[2] = 0xA8; set[3] = 1; STORE_32(0x0800C900, 4, set);
+	STORE_16(0, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN && isColor(renderer, 1, 0x03E0),
+	        "HGX4 A8 HGZ1 matches raw 64-byte indexed tile semantics");
+	uint8_t raw4[32]; memset(raw4, 0x11, sizeof(raw4));
+	hgzFixture(rom + 0xCA00, raw4, sizeof(raw4));
+	set[0] = 2; set[2] = 0; set[3] = 0; STORE_32(0x0800CA00, 4, set);
+	STORE_32(0x08007D00, 8, set); STORE_16(0x001F, 0x7D02, rom);
+	STORE_16(0, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F), "HGX4 legacy four-bit HGZ1 matches raw atlas pixels and palette banks");
+	STORE_16(1, 0x7C50, rom); h4Draw(renderer, 2, 0, true);
+	require(renderer->row[0] == FLAG_UNWRITTEN, "HGX4 legacy HGZ1 rejects tile references beyond unpacked atlas");
+	STORE_16(0, 0x7C50, rom);
+	/* More than the former 32-entry cache limit must coexist in one immutable
+	 * scene without turning later cells transparent. */
+	memset(cells, 0, 3072); memset(raw, 15, 64);
+	for (unsigned n = 0; n < 40; ++n) {
+		unsigned layoutAddress = 0xD000 + n * 24;
+		unsigned setAddress = 0xD400 + n * 40;
+		unsigned refsAddress = 0xDB00 + n * 16;
+		unsigned attrsAddress = 0xDE00 + n * 4;
+		unsigned containerAddress = 0xE000 + n * 64;
+		memset(rom + layoutAddress, 0, 24); memset(rom + setAddress, 0, 40);
+		STORE_32(0x08000000 + setAddress, layoutAddress + 16, rom);
+		STORE_32(0x08000000 + setAddress, layoutAddress + 20, rom);
+		rom[setAddress] = 2; rom[setAddress + 2] = 0xA9; rom[setAddress + 3] = 1;
+		STORE_32(0x08000000 + containerAddress, setAddress + 4, rom);
+		STORE_32(0x08007D00, setAddress + 8, rom); STORE_32(0x08000000 + refsAddress, setAddress + 12, rom);
+		STORE_32(0x08000000 + attrsAddress, setAddress + 20, rom); STORE_32(0x08007D00, setAddress + 24, rom);
+		STORE_32(8, setAddress + 28, rom); STORE_32(1, setAddress + 32, rom); STORE_32(64, setAddress + 36, rom);
+		memset(rom + refsAddress, 0, 16); STORE_32(0, attrsAddress, rom);
+		hgzFixture(rom + containerAddress, raw, 64);
+		STORE_32(0x08000000 + layoutAddress, n * 16, cells);
+	}
+	h4Draw(renderer, 2, 0, true);
+	require(isColor(renderer, 0, 0x001F) && isColor(renderer, 14 * 16, 0x001F),
+	        "HGX4 A9 retains more than 32 compressed resources in one frame");
+#endif
+	STORE_32(0, 0, control); GBAVideoSoftwareRendererLatchHGX4(renderer);
 }
 
 static void paletteCapacityTest(struct mCore* core) {
@@ -1059,6 +1200,7 @@ int main(void) {
 	h4Tests(gba, renderer);
 	obj256Tests(core);
 	bg256Tests(core);
+	bgScaled8Tests(core);
 	paletteCapacityTest(core);
     uint8_t* ordinary = malloc(0x4000);
     require(ordinary != NULL, "allocate ordinary-ROM opt-out regression");

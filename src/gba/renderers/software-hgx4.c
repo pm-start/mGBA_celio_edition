@@ -3,6 +3,9 @@
  * License, v. 2.0. https://mozilla.org/MPL/2.0/ */
 #include "gba/renderers/software-private.h"
 #include <mgba/internal/gba/gba.h>
+#ifdef USE_ZLIB
+#include <zlib.h>
+#endif
 
 /* HGX4 is independent of HGX2/3. The game publishes ownership cells, camera,
  * clock and environment atomically. At scanline zero these become immutable
@@ -13,7 +16,9 @@
 #define H4_ROWS 12
 #define H4_CELLS (H4_COLUMNS * H4_ROWS)
 #define H4_OVERLAYS 64
-#define H4_RESOURCES 32
+#define H4_RESOURCES 1024
+#define H4_RESOURCE_BYTES (128U * 1024U * 1024U)
+#define H4_HGZ_RAW_BYTES (16U * 1024U * 1024U)
 #define H4_PALETTES 4096
 
 struct H4Tile {
@@ -21,13 +26,19 @@ struct H4Tile {
 	const uint16_t* palette;
 	uint16_t ref;
 	uint8_t depth, paletteBank;
+	uint16_t side;
 };
 struct H4Palette {
 	uint32_t source, callback;
 	unsigned role, firstColor, count;
 	uint16_t colors[256];
 };
-struct H4Resource { uint32_t source; uint8_t* data; size_t size; };
+struct H4Resource {
+	uint32_t source, generation;
+	uint8_t* data;
+	size_t size;
+	uint8_t format;
+};
 struct H4MaterialCache { uint32_t layout; uint16_t ref; struct H4Tile tile; };
 struct GBAVideoHGX4 {
 	bool valid;
@@ -38,6 +49,8 @@ struct GBAVideoHGX4 {
 	struct H4Tile tiles[3][H4_CELLS][4];
 	struct H4Resource resources[H4_RESOURCES];
 	unsigned resourceCount;
+	uint32_t resourceGeneration;
+	size_t resourceBytes;
 	struct H4MaterialCache material[4096];
 	struct H4Palette palettes[H4_PALETTES];
 	unsigned paletteCount;
@@ -73,17 +86,64 @@ void GBAVideoSoftwareRendererResetHGX4(struct GBAVideoSoftwareRenderer* renderer
 	renderer->hgx4 = NULL;
 }
 
+static struct H4Resource* _h4CachedResource(struct GBAVideoHGX4* state, uint32_t source, unsigned format) {
+	for (unsigned n = 0; n < state->resourceCount; ++n) {
+		struct H4Resource* resource = &state->resources[n];
+		if (resource->data && resource->source == source && resource->format == format) {
+			resource->generation = state->resourceGeneration;
+			return resource;
+		}
+	}
+	return NULL;
+}
+
+static struct H4Resource* _h4ResourceSlot(struct GBAVideoHGX4* state, size_t size) {
+	if (!size || size > H4_RESOURCE_BYTES) { return NULL; }
+	for (;;) {
+		for (unsigned n = 0; n < state->resourceCount; ++n) {
+			if (!state->resources[n].data && state->resourceBytes <= H4_RESOURCE_BYTES - size) {
+				return &state->resources[n];
+			}
+		}
+		if (state->resourceCount < H4_RESOURCES && state->resourceBytes <= H4_RESOURCE_BYTES - size) {
+			return &state->resources[state->resourceCount++];
+		}
+		bool evicted = false;
+		for (unsigned n = 0; n < state->resourceCount; ++n) {
+			struct H4Resource* resource = &state->resources[n];
+			if (resource->data && resource->generation != state->resourceGeneration) {
+				state->resourceBytes -= resource->size;
+				free(resource->data);
+				memset(resource, 0, sizeof(*resource));
+				evicted = true;
+				break;
+			}
+		}
+		if (!evicted) { return NULL; }
+	}
+}
+
+static const uint8_t* _h4StoreResource(struct GBAVideoHGX4* state, uint32_t source,
+		unsigned format, uint8_t* data, size_t size) {
+	struct H4Resource* slot = _h4ResourceSlot(state, size);
+	if (!slot) { free(data); return NULL; }
+	*slot = (struct H4Resource) { .source = source, .generation = state->resourceGeneration,
+		.data = data, .size = size, .format = format };
+	state->resourceBytes += size;
+	return data;
+}
+
 static const uint8_t* _h4Lz(struct GBAVideoSoftwareRenderer* renderer, uint32_t source, unsigned tile) {
 	struct GBAVideoHGX4* state = renderer->hgx4;
 	for (unsigned n = 0; n < state->resourceCount; ++n) {
 		struct H4Resource* resource = &state->resources[n];
-		if (resource->source == source) {
+		if (resource->data && resource->source == source && resource->format == 1) {
+			resource->generation = state->resourceGeneration;
 			return resource->size >= (tile + 1U) * 32 ? resource->data + tile * 32 : NULL;
 		}
 	}
 	/* ROM resources persist across scenes; never evict a pointer used by this
 	 * frame. 32 atlases cover current + four distinct neighboring map pairs. */
-	if (state->resourceCount == H4_RESOURCES) { return NULL; }
 	const uint8_t* header = _h4Read(renderer->d.p, source, 4);
 	if (!header) { return NULL; }
 	uint32_t value = _h4Word(header, 0);
@@ -112,10 +172,48 @@ static const uint8_t* _h4Lz(struct GBAVideoSoftwareRenderer* renderer, uint32_t 
 			}
 		}
 	}
-	state->resources[state->resourceCount++] = (struct H4Resource) { source, output, size };
-	return size >= (tile + 1U) * 32 ? output + tile * 32 : NULL;
+	const uint8_t* stored = _h4StoreResource(state, source, 1, output, size);
+	return stored && size >= (tile + 1U) * 32 ? stored + tile * 32 : NULL;
 invalid:
 	free(output); return NULL;
+}
+
+static const uint8_t* _h4HGZ(struct GBAVideoSoftwareRenderer* renderer, uint32_t source,
+		uint32_t expectedRawBytes, size_t* sizeOut) {
+	struct GBAVideoHGX4* state = renderer->hgx4;
+	struct H4Resource* cached = _h4CachedResource(state, source, 2);
+	if (cached) {
+		if (expectedRawBytes && cached->size != expectedRawBytes) { return NULL; }
+		if (sizeOut) { *sizeOut = cached->size; }
+		return cached->data;
+	}
+	const uint8_t* header = _h4Read(renderer->d.p, source, 20);
+	if (!header || _h4Word(header, 0) != 0x315A4748 || _h4Word(header, 4) != 1) { return NULL; }
+	uint32_t rawBytes = _h4Word(header, 8), packedBytes = _h4Word(header, 12);
+	uint32_t expectedCrc = _h4Word(header, 16);
+	if (!rawBytes || (expectedRawBytes && rawBytes != expectedRawBytes) || rawBytes > H4_HGZ_RAW_BYTES || !packedBytes
+	    || source > UINT32_MAX - 20 || !_h4Read(renderer->d.p, source + 20, packedBytes)) { return NULL; }
+#ifdef USE_ZLIB
+	uint8_t* output = malloc(rawBytes);
+	if (!output) { return NULL; }
+	z_stream stream = { 0 };
+	stream.next_in = (Bytef*) _h4Read(renderer->d.p, source + 20, packedBytes);
+	stream.avail_in = packedBytes;
+	stream.next_out = output;
+	stream.avail_out = rawBytes;
+	if (inflateInit(&stream) != Z_OK) { free(output); return NULL; }
+	int status = inflate(&stream, Z_FINISH);
+	bool exact = status == Z_STREAM_END && stream.total_in == packedBytes && stream.avail_in == 0
+	          && stream.total_out == rawBytes && stream.avail_out == 0;
+	inflateEnd(&stream);
+	if (!exact || crc32(0, output, rawBytes) != expectedCrc) { free(output); return NULL; }
+	const uint8_t* stored = _h4StoreResource(state, source, 2, output, rawBytes);
+	if (stored && sizeOut) { *sizeOut = rawBytes; }
+	return stored;
+#else
+	(void) expectedCrc;
+	return NULL;
+#endif
 }
 
 static const uint8_t* _h4Animated(struct GBAVideoSoftwareRenderer* renderer,
@@ -159,6 +257,20 @@ static const uint8_t* _h4Animated(struct GBAVideoSoftwareRenderer* renderer,
 }
 
 static bool _h4Is8(const uint8_t* set) { return set[2] == 0xA8 && set[3] == 1; }
+static bool _h4IsScaled8(const uint8_t* set) { return set[2] == 0xA9 && set[3] == 1; }
+
+static bool _h4Scaled8Descriptor(const uint8_t* set, unsigned index, unsigned* side, size_t* offset) {
+	uint32_t tileSide = _h4Word(set, 28);
+	uint32_t tileCount = _h4Word(set, 32);
+	uint32_t resourceBytes = _h4Word(set, 36);
+	if ((tileSide != 8 && tileSide != 16 && tileSide != 32 && tileSide != 64 && tileSide != 128)
+	    || !tileCount || index >= tileCount) { return false; }
+	uint64_t tileBytes = (uint64_t) tileSide * tileSide;
+	if (tileBytes * tileCount != resourceBytes || tileBytes * index > SIZE_MAX) { return false; }
+	*side = tileSide;
+	*offset = (size_t) tileBytes * index;
+	return true;
+}
 
 /* Palette snapshots are shared by material commands instead of embedding
  * 256 colors in every tile and every material-cache entry. */
@@ -190,21 +302,22 @@ static const uint16_t* _h4LegacyPalette(struct GBAVideoSoftwareRenderer* rendere
 	uint32_t address = _h4Word(layout, 16 + role * 4);
 	const uint8_t* set = _h4Read(renderer->d.p, address, 24);
 	if (!set) { return NULL; }
-	if (set[2] == 0xA8 && !_h4Is8(set)) { return NULL; }
+	if ((set[2] == 0xA8 && !_h4Is8(set)) || (set[2] == 0xA9 && !_h4IsScaled8(set))) { return NULL; }
 	uint32_t source = _h4Word(set, 8);
-	if (_h4Is8(set)) {
-		set = _h4Read(renderer->d.p, address, 28);
+	if (_h4Is8(set) || _h4IsScaled8(set)) {
+		set = _h4Read(renderer->d.p, address, _h4IsScaled8(set) ? 40 : 28);
 		if (!set) { return NULL; }
 		source = _h4Word(set, 24);
 		/* A marked set retains the original complete native palette specifically
 		 * for native4 materials and explicit 32-byte door frame sources. */
 		if (source < 0x08000000 || source >= 0x0C000000 || !_h4Read(renderer->d.p, source, 512)) { return NULL; }
 	}
-	return _h4Palette(renderer, source + bank * 32, set, role, bank * 16, 16, !_h4Is8(set));
+	return _h4Palette(renderer, source + bank * 32, set, role, bank * 16, 16,
+	                  !_h4Is8(set) && !_h4IsScaled8(set));
 }
 
 static struct H4Tile _h4MaterialUncached(struct GBAVideoSoftwareRenderer* renderer, uint32_t layoutAddress, uint16_t ref) {
-	struct H4Tile result = { .ref = ref, .depth = 4, .paletteBank = ref >> 12 };
+	struct H4Tile result = { .ref = ref, .depth = 4, .paletteBank = ref >> 12, .side = 8 };
 	const uint8_t* layout = _h4Read(renderer->d.p, layoutAddress, 24);
 	if (!layout) { return result; }
 	unsigned index = ref & 1023, role = index >= 640;
@@ -212,18 +325,43 @@ static struct H4Tile _h4MaterialUncached(struct GBAVideoSoftwareRenderer* render
 	if (!set) { return result; }
 	index -= role * 640;
 	uint32_t source = _h4Word(set, 4);
-	if (_h4Is8(set)) {
+	if (_h4Is8(set) || _h4IsScaled8(set)) {
 		/* Version one is raw8 only. Legacy 32-byte animation recipes cannot be
 		 * reinterpreted as 64-byte tiles; marked materials use their base frame. */
-		if (set[0] || source < 0x08000000 || source >= 0x0C000000) { return result; }
+		if ((_h4Is8(set) && set[0] != 0 && set[0] != 2) || (_h4IsScaled8(set) && set[0] != 0 && set[0] != 2)
+		    || source < 0x08000000 || source >= 0x0C000000) { return result; }
 		result.depth = 8; result.paletteBank = role ? 7 : 0;
-		result.pixels = _h4Read(renderer->d.p, source + index * 64, 64);
+		if (_h4IsScaled8(set)) {
+			set = _h4Read(renderer->d.p, _h4Word(layout, 16 + role * 4), 40);
+			unsigned side; size_t offset;
+			if (!set || !_h4Scaled8Descriptor(set, index, &side, &offset)) { return result; }
+			uint32_t resourceBytes = _h4Word(set, 36);
+			result.side = side;
+			if (set[0] == 2) {
+				const uint8_t* resource = _h4HGZ(renderer, source, resourceBytes, NULL);
+				if (resource) { result.pixels = resource + offset; }
+			} else if (_h4Read(renderer->d.p, source, resourceBytes)) {
+				result.pixels = _h4Read(renderer->d.p, source + (uint32_t) offset, (size_t) side * side);
+			}
+		} else if (set[0] == 2) {
+			size_t size = 0;
+			const uint8_t* resource = _h4HGZ(renderer, source, 0, &size);
+			if (resource && !(size & 63) && index < size / 64) { result.pixels = resource + index * 64; }
+		} else {
+			result.pixels = _h4Read(renderer->d.p, source + index * 64, 64);
+		}
 		uint32_t palette = _h4Word(set, 8);
 		if (palette >= 0x08000000 && palette < 0x0C000000) { result.palette = _h4Palette(renderer, palette, set, role, 0, 256, false); }
 	} else {
-		if (set[2] == 0xA8) { return result; } /* Unknown marked version. */
+		if (set[2] == 0xA8 || set[2] == 0xA9) { return result; } /* Unknown marked version. */
 		result.pixels = _h4Animated(renderer, set, role, index, false);
-		if (!result.pixels) { result.pixels = set[0] ? _h4Lz(renderer, source, index) : _h4Read(renderer->d.p, source + index * 32, 32); }
+		if (!result.pixels && set[0] == 2) {
+			size_t size = 0;
+			const uint8_t* resource = _h4HGZ(renderer, source, 0, &size);
+			if (resource && !(size & 31) && index < size / 32) { result.pixels = resource + index * 32; }
+		} else if (!result.pixels) {
+			result.pixels = set[0] ? _h4Lz(renderer, source, index) : _h4Read(renderer->d.p, source + index * 32, 32);
+		}
 		result.palette = _h4LegacyPalette(renderer, layout, ref);
 	}
 	return result;
@@ -231,7 +369,7 @@ static struct H4Tile _h4MaterialUncached(struct GBAVideoSoftwareRenderer* render
 
 static struct H4Tile _h4DoorTile(struct GBAVideoSoftwareRenderer* renderer, uint32_t layoutAddress,
                                uint16_t ref, uint32_t source) {
-	struct H4Tile result = { .ref = ref, .depth = 4, .paletteBank = ref >> 12 };
+	struct H4Tile result = { .ref = ref, .depth = 4, .paletteBank = ref >> 12, .side = 8 };
 	const uint8_t* layout = _h4Read(renderer->d.p, layoutAddress, 24);
 	if (!layout || source < 0x08000000 || source >= 0x0C000000) { return result; }
 	result.pixels = _h4Read(renderer->d.p, source + ((ref & 1023) - 1016) * 32, 32);
@@ -256,7 +394,8 @@ static struct H4Tile _h4Material(struct GBAVideoSoftwareRenderer* renderer, uint
 
 static bool _h4Visible(const struct H4Tile* tile) {
 	if (!tile->pixels) { return false; }
-	for (unsigned n = 0; n < (tile->depth == 8 ? 64U : 32U); ++n) { if (tile->pixels[n]) { return true; } }
+	size_t bytes = tile->depth == 8 ? (size_t) tile->side * tile->side : 32U;
+	for (size_t n = 0; n < bytes; ++n) { if (tile->pixels[n]) { return true; } }
 	return false;
 }
 
@@ -333,11 +472,13 @@ void GBAVideoSoftwareRendererLatchHGX4(struct GBAVideoSoftwareRenderer* renderer
 	state->animationTable = _h4Word(control, 24);
 	state->animationCount = _h4Word(control, 28);
 	if (state->animationCount > 1024) { return; }
-	/* Release caches only at a scene boundary, before any commands retain
-	 * pointers. No lifetime/visit-count limit on world traversal. */
-	if (state->resourceCount > H4_RESOURCES - 10) {
-		for (unsigned n = 0; n < state->resourceCount; ++n) { free(state->resources[n].data); }
-		state->resourceCount = 0;
+	/* A new generation begins only after the previous frame's commands stop
+	 * being used. Stale resources may then be evicted on demand. */
+	if (++state->resourceGeneration == 0) {
+		state->resourceGeneration = 1;
+		for (unsigned n = 0; n < state->resourceCount; ++n) {
+			if (state->resources[n].data) { state->resources[n].generation = 0; }
+		}
 	}
 	memset(state->tiles, 0, sizeof(state->tiles));
 	memset(state->material, 0, sizeof(state->material));
@@ -395,7 +536,15 @@ bool GBAVideoSoftwareRendererDrawHGX4(struct GBAVideoSoftwareRenderer* renderer,
 		if (!tile->pixels || !tile->palette) { continue; }
 		unsigned tx = sx & 7, ty = sy & 7;
 		if (tile->ref & 0x400) { tx ^= 7; } if (tile->ref & 0x800) { ty ^= 7; }
-		unsigned pixel = tile->depth == 8 ? tile->pixels[ty * 8 + tx] : (tile->pixels[ty * 4 + tx / 2] >> ((tx & 1) * 4)) & 15;
+		unsigned pixel;
+		if (tile->depth == 8) {
+			unsigned scale = tile->side / 8;
+			unsigned sampleX = tx * scale + scale / 2;
+			unsigned sampleY = ty * scale + scale / 2;
+			pixel = tile->pixels[sampleY * tile->side + sampleX];
+		} else {
+			pixel = (tile->pixels[ty * 4 + tx / 2] >> ((tx & 1) * 4)) & 15;
+		}
 		if (!pixel) { continue; }
 		uint16_t raw = tile->palette[pixel];
 		if ((raw & 0x7FFF) && (state->scene[10] & (1U << tile->paletteBank))) { raw = _h4Tint(raw, state->scene[9], state->scene[8]); }

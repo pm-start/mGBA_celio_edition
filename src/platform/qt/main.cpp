@@ -95,6 +95,7 @@ int main(int argc, char* argv[]) {
 
 	QApplication::setApplicationName(projectName);
 	QApplication::setApplicationVersion(projectVersion);
+	QApplication::setApplicationDisplayName(QStringLiteral("%1 ver: %2").arg(projectName).arg(projectVersion));
 #if (QT_VERSION < QT_VERSION_CHECK(6, 0, 0))
 	QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps, true);
 #endif
