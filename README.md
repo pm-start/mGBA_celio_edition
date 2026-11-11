@@ -1,33 +1,58 @@
-> **About this branch (`rom64`)**
+> **About this branch (`rom128`)**
 >
-> This is [mGBA celio edition](https://github.com/Exormeter/mGBA_celio_edition) 2.0.0 with support for 64MiB ROMs.
+> This is [mGBA celio edition](https://github.com/Exormeter/mGBA_celio_edition) 2.0.0 extended to handle
+> **ROMs of up to 128MiB** and **flash saves of up to 16MiB** (plus the earlier `rom64` additions listed below).
+> These sizes do not exist on real hardware. Games that use them only work on this build.
 >
-> - When a ROM of exactly 64MiB is loaded, its second half is mapped at `0x0A000000`-`0x0BFFFFFF`.
->   `0x08000000`-`0x09FFFFFF` and `0x0C000000`-`0x0DFFFFFF` still see the first 32MiB.
-> - ROMs of 32MiB or less behave as before.
-> - The reported git commit can be overridden with the `MGBA_GIT_COMMIT` environment variable at build time,
->   so that Celio-mGBA-Link (which checks the commit of celio edition 2.0.0) keeps working.
-> - Windows build: File > ネット通信... (online link) connects two players through the public [Celio](https://github.com/Celio-Link) relay
->   with a 4-digit room number. No Lua script or web page is needed.
-> - Windows build: a real GBA can join through a GBLink / Celio USB adapter (its CDC serial port), either linked
->   directly with this emulator (no server) or entering a relay room in place of the emulated GBA. No web page is needed.
-> - Flash saves of up to 6MiB: a game that switches to flash banks 2-95 grows its 128KiB save to 6MiB
->   (saves of the earlier 1MiB version are kept and grown).
->   Saves of other games stay at 128KiB. Real carts only have banks 0 and 1, so games should only do this on this build.
-> - CPU overclock: instruction cycles are counted at 1/N (config `overclock` or `MGBA_OVERCLOCK`: 1, 2, 4 or 8; **default 2**).
->   DMA, video, audio, timers and serial keep their real timing, so games only lag less. Set `overclock=1` for real speed.
-> - 16MiB of extra RAM at `0x01000000`-`0x01FFFFFF` (unused on real hardware): zero wait states, code can run from it,
->   DMA can read it, and save states keep it. The BIOS CpuSet/CpuFastSet refuse it as a source, as on real hardware.
-> - Qt: automatic save backups. Each time the game finishes writing its save, a copy goes to `backups/<ROM name>/<date-time>.sav`
->   next to the ROM (at most one per 5 minutes, newest 30 kept, identical saves skipped). File > Save games > セーブのバックアップを開く
->   opens the folder. Config `saveBackup=0` turns it off.
-> - Windows release zips include an empty `portable.ini`, so settings (`config.ini`, `qt.ini`) are kept next to `mGBA.exe`
->   instead of `%APPDATA%\mGBA`, which is shared with other mGBA builds that overwrite `config.ini` when they save.
+> ### What is different from celio edition 2.0.0 / mGBA
+>
+> - **128MiB ROM** (4 banks of 32MiB). `0x08000000`-`0x09FFFFFF` always shows bank 0. The window at
+>   `0x0A000000`-`0x0BFFFFFF` shows bank 1, 2 or 3. The window is selected by four consecutive 16-bit writes to
+>   `0x0B7FFF00`: `0xB128`, `0x5A0E`, `n`, `~n` (`n` = 1..3). Bank 1 is selected at start-up and on reset;
+>   the selected bank is stored in save states. A ROM of exactly 64MiB is mapped as before
+>   (second half at `0x0A000000`); ROMs of 32MiB or less behave as before.
+> - **Flash save up to 16MiB** (64KiB x 256 banks). A 6MiB `.sav` is opened as 6MiB and grows to 16MiB only when the
+>   game writes to bank 96 or above (reading does not grow it). Saves of 128KiB stay at 128KiB.
+>   Older 1MiB / 6MiB saves are kept and grown.
+> - **Save backups** (Qt): each time the game finishes writing its save, a copy goes to `backups/<ROM name>/<date-time>.sav`
+>   next to the ROM (at most one per 5 minutes, identical saves skipped). 30 generations are kept,
+>   10 for saves of 8MiB or more. File > Save games > セーブのバックアップを開く opens the folder. Config `saveBackup=0` turns it off.
+> - **Extra RAM** 16MiB at `0x01000000`-`0x01FFFFFF` (no wait states, usable as a DMA source, kept in save states).
+> - **CPU overclock**: instruction cycles are counted at 1/N (config `overclock` or `MGBA_OVERCLOCK`: 1, 2, 4 or 8; default 2).
+>   DMA, video, audio, timers and serial keep their real speed.
+> - **Fast flash**: short flash write/erase waits so an in-game save takes a few frames.
+> - **Online link** (Windows): File > ネット通信... connects two players through the public [Celio](https://github.com/Celio-Link) relay
+>   with a 4-digit room number, and a real GBA can join through a GBLink / Celio USB adapter. No Lua script or web page is needed.
+> - **Video** (liru): independent 256-color sprites and map materials, higher image resolution, lossless compression,
+>   metadata and day/night palette support. See [tools/hgx4-abi.md](tools/hgx4-abi.md) and [tools/obj256-abi.md](tools/obj256-abi.md).
+> - **Logging** (Qt): `logs/mGBA.log` next to the exe holds errors and warnings; `--log-debug` (or `MGBA_DEBUG_LOG=1`,
+>   or `debugLog=1` in `config.ini`) writes all levels.
+> - A reported git commit can be set with the `MGBA_GIT_COMMIT` environment variable at build time, so that
+>   Celio-mGBA-Link (which checks the commit of celio edition 2.0.0) keeps working.
+> - Windows release zips include an empty `portable.ini`: settings (`config.ini`, `qt.ini`) stay next to the exe
+>   instead of `%APPDATA%\mGBA`.
 > - LTO is off by default (`BUILD_LTO`): with it, the Lua bindings break on this branch.
-> - Games that use the second half of a 64MiB ROM, flash banks 2-95 or the extra RAM only work on this build;
->   other emulators and real hardware cannot use them.
 >
-> See [readme.txt](readme.txt) (Japanese) for usage notes. License: MPL-2.0, same as mGBA.
+> ### Building (Windows, 64-bit)
+>
+> All of the above are ordinary commits on this branch; no patches have to be applied. See
+> [tools/rom128/README.md](tools/rom128/README.md) for the full procedure. In short, with
+> [MSYS2](https://www.msys2.org/) installed and the source in a path of ASCII characters only:
+>
+> ```sh
+> pacman -S --needed mingw-w64-x86_64-{gcc,cmake,ninja,pkgconf,qt5-base,qt5-multimedia,qt5-tools,SDL2,lua,libzip,libepoxy,json-c,brotli}
+> MSYS2_ROOT=/c/msys64 bash tools/rom128/build_win.sh                 # -> dist/mgba-celio.exe
+> python tools/rom128/package.py --release 4 --dist dist --out out    # -> release zip
+> ```
+>
+> ### License
+>
+> mGBA and this branch: MPL-2.0 (see `LICENSE`). A build with `FFMPEG=ON` links FFmpeg and bundles FFmpeg, x264, x265, Xvid
+> and vid.stab from MSYS2, which are GPL: such a zip must come with the GPL notice and the way to get the sources
+> (`readme.txt`, `source/SOURCE.txt`, `source/BUNDLED_DLLS.txt` in the zip; package sources at https://repo.msys2.org/mingw/sources/).
+> Upstream: https://github.com/Exormeter/mGBA_celio_edition, https://github.com/mgba-emu/mgba.
+>
+> See [readme.txt](readme.txt) (Japanese) for usage notes of the release build.
 
 mGBA
 ====
