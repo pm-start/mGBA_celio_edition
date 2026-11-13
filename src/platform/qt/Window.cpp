@@ -1132,6 +1132,11 @@ void Window::reloadDisplayDriver() {
 	});
 
 	connect(m_display.get(), &QGBA::Display::contentSizeChanged, [this](const QSize& size) {
+		if (size.isEmpty()) {
+			// The painter reports 0x0 before the first frame; resizing to 0x0 shrinks the window to its
+			// minimum and recalculateFrameSize() then resets m_savedScale, losing the saved frame size.
+			return;
+		}
 		if (m_savedScale > 0 && !m_config->getOption("lockFrameSize").toInt()) {
 			resizeFrame(size * m_savedScale);
 		}
