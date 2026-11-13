@@ -53,8 +53,9 @@ if(NOT GIT_BRANCH)
 	set(GIT_BRANCH "(unknown)")
 endif()
 
-set(CELIO_VERSION "rom128-2" CACHE STRING "Dedicated mgba-celio application version")
+set(CELIO_VERSION "rom128-5" CACHE STRING "Dedicated mgba-celio application version")
 set(VERSION_STRING "${CELIO_VERSION}")
+set(GIT_COMMIT_SHORT "${CELIO_VERSION}")
 
 if(DEFINED PRINT_STRING)
 	if(NOT DEFINED ${PRINT_STRING})
