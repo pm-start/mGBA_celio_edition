@@ -6,7 +6,7 @@
 GBA エミュレーター mGBA の改造版「mGBA celio edition 2.0.0」に、
 128MB（128MiB）までの ROM と、16MB までのセーブを扱えるようにする変更を加えたものです。
 
-リリース: rom128-4
+リリース: rom128-5
 
   - ちょうど 64MB の ROM を読み込むと、ROM の後ろ半分（32MB）が
     0x0A000000〜0x0BFFFFFF に見えます。
@@ -16,6 +16,12 @@ GBA エミュレーター mGBA の改造版「mGBA celio edition 2.0.0」に、
     起動とリセットのときはバンク 1 です。64MB 以下の ROM は、これまでどおりに動きます。
   - 32MB 以下の ROM は、これまでの mGBA と同じように動きます。
   - celio edition の通信機能（Celio-mGBA-Link のスクリプト）は、2.0.0 と同じように使えます。
+
+rom128-5 の変更（mGBA のリリース 5 つ目）
+-----------------------------------------
+  - 画面サイズを ×2 以上にして ROM を開くと、設定は ×2 以上なのに画面が ×1 になる不具合を直しました。
+    あわせて、画面サイズが保存されず、起動のたびに ×1 に戻る不具合も直りました。
+  - それ以外（ROM・セーブ・ネット通信・録画など）は rom128-4 と同じです。
 
 rom128-4 の変更（mGBA のリリース 4 つ目）
 -----------------------------------------
@@ -152,8 +158,8 @@ mGBA のソースの差分は source/rom128-branch.diff にあります（文書
 mGBA は Mozilla Public License 2.0（MPL-2.0）で公開されています。
 この版のソースコード（変更を含む）は次の場所にあります。
 
-  変更を加えたソース（rom128-4 のタグ）:
-    https://github.com/pm-start/mGBA_celio_edition/tree/rom128-4
+  変更を加えたソース（rom128-5 のタグ）:
+    https://github.com/pm-start/mGBA_celio_edition/tree/rom128-5
   元にした mGBA celio edition:
     https://github.com/Exormeter/mGBA_celio_edition
   mGBA 本家:
