@@ -52,6 +52,8 @@ enum CommandType : uint16_t {
 	CmdSetMode = 0x00,
 	CmdCancel = 0x01,
 	CmdGetFirmwareInfo = 0x0F,
+	// 0x10 is SetModeMaster on the old relay and the USB firmware. The 4-player relay (Celio-Server, 2026-10-17) uses it
+	// for PlayerSettings with {playerCount, playerIndex}; those two values arrive in Incoming.data (empty = old SetModeMaster)
 	CmdSetModeMaster = 0x10,
 	CmdSetModeSlave = 0x11,
 	CmdStartHandshake = 0x12,
@@ -75,6 +77,20 @@ const uint8_t LINK_MODE_ONLINE = 0x01; // LinkMode.onlineLink
 const uint32_t IE_REG = 0x200;
 const uint32_t IF_REG = 0x202;
 const uint16_t SIO_IRQ_MASK = 0x80;
+
+// Celio-Server 4-player form (celio_device.lua PACKET_SIZE 17 / MAX_BUFFERED_PACKETS 3, validation.ts DATA_ARRAY_LENGTH 51):
+// deviceData is 51 bytes = 3 commands of [seat byte, 8 little endian words]. This build links 2 players only.
+const size_t NEW_PACKET_SIZE = 17;
+const size_t NEW_BUFFERED_COMMANDS = 3;
+const size_t OLD_BUFFERED_COMMANDS = 4; // 32 words: the old relay and the USB adapter
+const long SUPPORTED_PLAYERS = 2;
+
+// MGBA_CELIO_NET_LEGACY=1: the form of rom128-5 (sessionCreate without a player count, 32 words of 16 bit, partnerJoined,
+// 0x10/0x11 for the roles) for a relay that still speaks it. For tests only; the public relay needs the new form.
+bool legacyEnv() {
+	static const bool legacy = []() { const char* e = getenv("MGBA_CELIO_NET_LEGACY"); return e && *e && *e != '0'; }();
+	return legacy;
+}
 
 long long nowMs() {
 	using namespace std::chrono;
@@ -523,16 +539,32 @@ struct CelioNet::Device {
 	bool timerEnabled = false;
 	int timerCount = 0;
 	Mode mode = Mode::Slave;
+	// PlayerSettings (4-player relay): seat of the emulated GBA's partner is the other seat; seat 0 is the master GBA
+	bool playerSettings = false;
+	long playerCount = SUPPORTED_PLAYERS;
+	long seat = 0;
 
 	void resetState(bool init) {
 		Mode keep = mode;
+		bool keepSettings = playerSettings;
+		long keepCount = playerCount;
+		long keepSeat = seat;
 		*this = Device();
 		mode = keep;
+		playerSettings = keepSettings;
+		playerCount = keepCount;
+		seat = keepSeat;
 		if (!init) {
 			handshake = Handshake::Listening;
 		}
 	}
 };
+
+// The 4-player relay form is used for the emulated device in a relay room. The USB adapter paths (Direct, NetUsb, FakeAdapter)
+// keep the rom128-5 behaviour: they could not be tried without the hardware.
+static bool useNewForm(CelioNet::Kind kind) {
+	return kind == CelioNet::Kind::Net && !legacyEnv();
+}
 
 CelioNet* CelioNet::instance() {
 	static CelioNet net;
@@ -881,7 +913,23 @@ void CelioNet::emitStatus(uint16_t status) {
 void CelioNet::emitData(const std::vector<uint16_t>& data) {
 	switch (m_kind) {
 	case Kind::Net:
-		queueOutgoing(Outgoing{false, 0, data});
+		if (useNewForm(m_kind)) {
+			// celio_device.lua flush_rx_queue: each command of 8 words goes out as [seat, 16 bytes little endian]
+			uint16_t seat = m_device ? (uint16_t) m_device->seat : 0;
+			std::vector<uint16_t> bytes;
+			bytes.reserve(NEW_PACKET_SIZE * NEW_BUFFERED_COMMANDS);
+			for (size_t c = 0; c < NEW_BUFFERED_COMMANDS; ++c) {
+				bytes.push_back(seat);
+				for (size_t i = 0; i < 8; ++i) {
+					uint16_t w = c * 8 + i < data.size() ? data[c * 8 + i] : 0;
+					bytes.push_back(w & 0xFF);
+					bytes.push_back(w >> 8);
+				}
+			}
+			queueOutgoing(Outgoing{false, 0, std::move(bytes)});
+		} else {
+			queueOutgoing(Outgoing{false, 0, data});
+		}
 		break;
 	case Kind::Direct:
 	case Kind::FakeAdapter:
@@ -914,8 +962,21 @@ void CelioNet::drainIncoming() {
 	for (Incoming& in : items) {
 		if (!in.isCommand) {
 			// celio_device:receive_data
-			for (uint16_t v : in.data) {
-				d->receivedQueue.push_back(v);
+			if (useNewForm(m_kind)) {
+				// packets of [seat, 8 little endian words]; only the other seats (below the player count) are queued
+				for (size_t offset = 0; offset + NEW_PACKET_SIZE <= in.data.size(); offset += NEW_PACKET_SIZE) {
+					long seat = in.data[offset];
+					if (seat == d->seat || seat >= d->playerCount) {
+						continue;
+					}
+					for (size_t i = offset + 1; i < offset + NEW_PACKET_SIZE; i += 2) {
+						d->receivedQueue.push_back((uint16_t) (in.data[i] | (in.data[i + 1] << 8)));
+					}
+				}
+			} else {
+				for (uint16_t v : in.data) {
+					d->receivedQueue.push_back(v);
+				}
 			}
 			continue;
 		}
@@ -939,12 +1000,28 @@ void CelioNet::drainIncoming() {
 			d->mode = Mode::Slave;
 			setSioMask(0x600B);
 			break;
-		case CmdSetModeMaster:
-			log("device command SetModeMaster");
+		case CmdSetModeMaster: // = 0x10
 			m_roleSet = true;
 			d->handshake = Handshake::Listening;
-			d->mode = Mode::Master;
-			setSioMask(0x601F);
+			if (in.data.size() >= 2) {
+				// PlayerSettings (celio_device.lua receive_command): the emulated GBA in seat 0 is the master of the cable,
+				// so the device acts as slave there and as master in the other seat. Masks are sio_mask(seat): 0x600B | 4 | seat << 4
+				d->playerSettings = true;
+				d->playerCount = in.data[0];
+				d->seat = in.data[1];
+				log("device command PlayerSettings count " + std::to_string(d->playerCount) + " seat " + std::to_string(d->seat));
+				if (d->seat == 0) {
+					d->mode = Mode::Slave;
+					setSioMask(0x600B);
+				} else {
+					d->mode = Mode::Master;
+					setSioMask(0x601F);
+				}
+			} else {
+				log("device command SetModeMaster");
+				d->mode = Mode::Master;
+				setSioMask(0x601F);
+			}
 			break;
 		case CmdStartHandshake:
 			log("device command StartHandshake");
@@ -952,7 +1029,10 @@ void CelioNet::drainIncoming() {
 			break;
 		case CmdConnectLink:
 			log("device command ConnectLink");
-			d->startConnect = true;
+			// the emulated GBA in seat 0 sends the master handshake itself (celio_device.lua)
+			if (!d->playerSettings || d->seat != 0) {
+				d->startConnect = true;
+			}
 			break;
 		default:
 			log("device unknown command " + std::to_string(in.command));
@@ -1016,8 +1096,12 @@ void CelioNet::sioReadHook(void* context) {
 	case Transive::Crc: {
 		// transive_crc
 		auto flush = [self, d]() {
+			bool newForm = useNewForm(self->m_kind);
+			if (newForm && d->transmitQueue.empty()) {
+				return; // flush_rx_queue sends nothing when no command is waiting
+			}
 			std::vector<uint16_t> data(d->transmitQueue.begin(), d->transmitQueue.end());
-			data.resize(32, 0);
+			data.resize(newForm ? NEW_BUFFERED_COMMANDS * 8 : OLD_BUFFERED_COMMANDS * 8, 0);
 			d->transmitQueue.clear();
 			self->emitData(data);
 		};
@@ -1093,9 +1177,10 @@ void CelioNet::sioReadHook(void* context) {
 			d->currentRx.clear();
 			d->transive = Transive::Crc;
 		}
-		if (d->transmitQueue.size() >= 32) {
+		size_t bufferedCommands = useNewForm(self->m_kind) ? NEW_BUFFERED_COMMANDS : OLD_BUFFERED_COMMANDS;
+		if (d->transmitQueue.size() >= bufferedCommands * 8) {
 			std::vector<uint16_t> data(d->transmitQueue.begin(), d->transmitQueue.end());
-			data.resize(32, 0);
+			data.resize(bufferedCommands * 8, 0);
 			d->transmitQueue.clear();
 			self->emitData(data);
 		}
@@ -1309,7 +1394,9 @@ void CelioNet::handleMessage(const std::string& msg) {
 			m_sessionAck = m_nextAck++;
 			if (m_joinRoom.empty()) {
 				setMessage("へやを つくっています…");
-				sendText("42" + std::to_string(m_sessionAck) + "[\"sessionCreate\",null]");
+				// Celio-Server client.ts sessionCreate: the player count (<= 4, validation.ts isPlayerNumber); null is "Invalid request".
+				// celio_watch.py reads the argument of the first sessionCreate literal in this file.
+				sendText("42" + std::to_string(m_sessionAck) + (useNewForm(m_kind) ? "[\"sessionCreate\",2]" : "[\"sessionCreate\",null]"));
 			} else {
 				setMessage("へや " + m_joinRoom + " に はいっています…");
 				sendText("42" + std::to_string(m_sessionAck) + "[\"sessionJoin\",\"" + m_joinRoom + "\"]");
@@ -1375,10 +1462,11 @@ void CelioNet::handleAck(long id, const std::string& json) {
 	m_inSession = true;
 	m_deviceOn = true;
 	m_roleSet = false;
-	m_linkActive = !m_joinRoom.empty();
 	if (m_joinRoom.empty()) {
+		m_linkActive = false;
 		setState(State::WaitingPartner, "へやの 番号を 相手に つたえて、まってください");
-	} else {
+	} else if (!m_linkActive.exchange(true)) {
+		// (the 4-player relay's partyReady can arrive before this reply; it has started the link already then)
 		setState(State::Linking, "相手と つながりました。通信の じゅんびを しています…");
 		startLinkMode();
 	}
@@ -1435,8 +1523,30 @@ void CelioNet::handleEvent(const std::string& json, long ackId) {
 			m_seenCommands.insert(uuid);
 		}
 		log("server command " + std::to_string(command));
+		if (command == CmdSetModeMaster && useNewForm(m_kind)) {
+			// 0x10 = PlayerSettings {playerCount, playerIndex} (celio_device.lua receive_command)
+			long count = 0;
+			long index = 0;
+			if (!jsonNumber(json, "playerCount", count) || !jsonNumber(json, "playerIndex", index)) {
+				log("PlayerSettings without args " + json);
+				return;
+			}
+			if (count != SUPPORTED_PLAYERS || index < 0 || index >= count) {
+				log("PlayerSettings not supported: count " + std::to_string(count) + " index " + std::to_string(index));
+				setState(State::Error, "この mGBA は 2 人の つうしんだけ できます");
+				m_stopping = true;
+				std::lock_guard<std::mutex> lock(m_wsLock);
+				if (m_ws) {
+					m_ws->abort();
+				}
+				return;
+			}
+			pushIncoming(Incoming{true, (uint16_t) command, {(uint16_t) count, (uint16_t) index}});
+			return;
+		}
 		pushIncoming(Incoming{true, (uint16_t) command, {}});
-	} else if (name == "partnerJoined") {
+	} else if (name == "partnerJoined" || name == "partyReady") {
+		// partyReady: Celio-Server 2026-10-17 (session.ts enter), sent to every client once the room is full
 		if (m_linkActive.exchange(true)) {
 			log("partnerJoined ignored (already linking)");
 			return;
@@ -1452,7 +1562,7 @@ void CelioNet::handleEvent(const std::string& json, long ackId) {
 			m_outSequence = 0;
 		}
 		startLinkMode();
-	} else if (name == "partnerLeft") {
+	} else if (name == "partnerLeft" || name == "partyNotReady") {
 		m_linkActive = false;
 		m_roleSet = false;
 		setState(State::WaitingPartner, "相手が ぬけました。へやの 番号を つたえて、まってください");
@@ -1546,17 +1656,16 @@ void CelioNet::workThread() {
 			if (item.isStatus) {
 				text = "42[\"deviceStatus\",{\"uuid\":\"" + makeUuid() + "\",\"linkStatus\":" + std::to_string(item.status) + "}]";
 			} else {
-				// Celio-Server since 2026-10-03 only accepts an array of packets (isDataPacketBatch) and
-				// answers a single object with ack=false and drops it. MGBA_CELIO_NET_LEGACY=1 sends the old single object.
-				static const bool legacy = []() { const char* e = getenv("MGBA_CELIO_NET_LEGACY"); return e && *e && *e != '0'; }();
-				text = std::string("42[\"deviceData\",") + (legacy ? "" : "[") + "{\"sequence\":" + std::to_string(m_outSequence) + ",\"data\":[";
+				// Celio-Server only accepts an array of packets (isDataPacketBatch) of DATA_ARRAY_LENGTH values and answers anything
+				// else with ack=false and drops it. 51 values 0..255 in the new form (Celio-Server 2026-10-17), 32 words in the old one.
+				text = "42[\"deviceData\",[{\"sequence\":" + std::to_string(m_outSequence) + ",\"data\":[";
 				for (size_t i = 0; i < item.data.size(); ++i) {
 					if (i) {
 						text += ",";
 					}
 					text += std::to_string(item.data[i]);
 				}
-				text += legacy ? "]}]" : "]}]]";
+				text += "]}]]";
 			}
 			lock.unlock();
 			bool ok = sendText(text);
